@@ -353,6 +353,9 @@ python3 etcd-stress-tools.py \
 - Fast network connection to cluster
 - SSD storage for etcd cluster
 
+### Demo
+[![asciicast](https://asciinema.org/a/745466.svg)](https://asciinema.org/a/745466)
+
 ## License
 
 This tool is provided as-is for testing and educational purposes. Use responsibly and ensure proper authorization before running against production clusters.

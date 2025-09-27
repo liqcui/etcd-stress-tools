@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/big"
 	mathrand "math/rand"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -98,7 +99,7 @@ type EtcdStressTools struct {
 func NewConfig() *Config {
 	config := &Config{
 		TotalNamespaces:            getEnvInt("TOTAL_NAMESPACES", 100),
-		NamespaceParallel:          getEnvInt("NAMESPACE_PARALLEL", 10),
+		NamespaceParallel:          getEnvInt("NAMESPACE_PARALLEL", 5), // Reduced from 10
 		NamespacePrefix:            getEnvString("NAMESPACE_PREFIX", "stress-test"),
 		SmallConfigMapsPerNS:       10,
 		LargeConfigMapsPerNS:       3,
@@ -112,10 +113,10 @@ func NewConfig() *Config {
 		CreateNetworkPolicies:      getEnvBool("CREATE_NETWORK_POLICIES", true),
 		CreateANPBANP:              getEnvBool("CREATE_ANP_BANP", true),
 		CreateImages:               getEnvBool("CREATE_IMAGES", true),
-		MaxConcurrentOperations:    getEnvInt("MAX_CONCURRENT_OPERATIONS", 50),
+		MaxConcurrentOperations:    getEnvInt("MAX_CONCURRENT_OPERATIONS", 20), // Reduced from 50
 		NamespaceReadyTimeout:      time.Duration(getEnvInt("NAMESPACE_READY_TIMEOUT", 60)) * time.Second,
-		ResourceRetryCount:         getEnvInt("RESOURCE_RETRY_COUNT", 3),
-		ResourceRetryDelay:         time.Duration(getEnvFloat("RESOURCE_RETRY_DELAY", 1.0)*1000) * time.Millisecond,
+		ResourceRetryCount:         getEnvInt("RESOURCE_RETRY_COUNT", 5),                                            // Increased from 3
+		ResourceRetryDelay:         time.Duration(getEnvFloat("RESOURCE_RETRY_DELAY", 2.0)*1000) * time.Millisecond, // Increased from 1.0
 		LogLevel:                   getEnvString("LOG_LEVEL", "INFO"),
 		CleanupOnCompletion:        getEnvBool("CLEANUP_ON_COMPLETION", false),
 	}
@@ -187,6 +188,20 @@ func (e *EtcdStressTools) setupKubernetesClients() error {
 		e.logInfo("Using in-cluster Kubernetes configuration", "MAIN")
 	}
 
+	// Configure client for high-load scenarios
+	config.QPS = 50.0                 // Moderate queries per second
+	config.Burst = 100                // Moderate burst capacity
+	config.Timeout = 60 * time.Second // Increase timeout
+
+	// Use a custom dialer for timeouts/keepalives; keep client-go's TLS-aware transport
+	config.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		d := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		return d.DialContext(ctx, network, address)
+	}
+
 	// Create clientset
 	e.clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
@@ -199,6 +214,7 @@ func (e *EtcdStressTools) setupKubernetesClients() error {
 		return fmt.Errorf("failed to create dynamic client: %w", err)
 	}
 
+	e.logInfo("Kubernetes clients configured successfully", "MAIN")
 	return nil
 }
 
@@ -316,28 +332,66 @@ func (e *EtcdStressTools) retryResourceOperation(ctx context.Context, operation 
 	for attempt := 0; attempt <= e.config.ResourceRetryCount; attempt++ {
 		if err := operation(); err != nil {
 			lastErr = err
-			if apierrors.IsNotFound(err) && strings.Contains(err.Error(), "not found") {
+
+			// Check for specific error types that should be retried
+			if apierrors.IsServerTimeout(err) ||
+				apierrors.IsTooManyRequests(err) ||
+				apierrors.IsServiceUnavailable(err) ||
+				isConnectionError(err) {
+				if attempt < e.config.ResourceRetryCount {
+					// Exponential backoff with jitter
+					baseDelay := e.config.ResourceRetryDelay * time.Duration(1<<uint(attempt))
+					jitter := time.Duration(mathrand.Int63n(int64(baseDelay / 2)))
+					waitTime := baseDelay + jitter
+
+					e.logWarn(fmt.Sprintf("Retrying operation after %v (attempt %d/%d): %v",
+						waitTime, attempt+1, e.config.ResourceRetryCount+1, err), "RETRY")
+
+					select {
+					case <-time.After(waitTime):
+						continue
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			} else if apierrors.IsNotFound(err) && strings.Contains(err.Error(), "not found") {
 				if attempt < e.config.ResourceRetryCount {
 					waitTime := e.config.ResourceRetryDelay * time.Duration(1<<uint(attempt))
-					time.Sleep(waitTime)
-					continue
+					select {
+					case <-time.After(waitTime):
+						continue
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				}
 			} else if apierrors.IsAlreadyExists(err) {
 				return nil
 			} else {
+				// Don't retry other errors
 				break
 			}
 		} else {
 			return nil
 		}
-
-		if attempt < e.config.ResourceRetryCount {
-			waitTime := e.config.ResourceRetryDelay * time.Duration(1<<uint(attempt))
-			time.Sleep(waitTime)
-		}
 	}
 
 	return lastErr
+}
+
+// isConnectionError checks if the error is a connection-related error
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "eof") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "goaway") ||
+		strings.Contains(errStr, "http2") ||
+		strings.Contains(errStr, "unexpected error when reading response body")
 }
 
 // generateRandomData generates random hex data of specified size
@@ -539,13 +593,13 @@ func generateKeyPair() (privateKeyPEM, publicKeyPEM, certificatePEM string, err 
 		return "", "", "", err
 	}
 
-	// Encode private key
+	// Encode private key to PEM format
 	privateKeyDER := x509.MarshalPKCS1PrivateKey(privateKey)
 	privateKeyBlock := &pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: privateKeyDER,
 	}
-	privateKeyPEM = base64.StdEncoding.EncodeToString(pem.EncodeToMemory(privateKeyBlock))
+	privateKeyPEM = string(pem.EncodeToMemory(privateKeyBlock))
 
 	// Generate public key in SSH format (simplified)
 	publicKeyBytes := make([]byte, 256)
@@ -574,7 +628,7 @@ func generateKeyPair() (privateKeyPEM, publicKeyPEM, certificatePEM string, err 
 		Type:  "CERTIFICATE",
 		Bytes: certDER,
 	}
-	certificatePEM = base64.StdEncoding.EncodeToString(pem.EncodeToMemory(certBlock))
+	certificatePEM = string(pem.EncodeToMemory(certBlock))
 
 	return privateKeyPEM, publicKeyPEM, certificatePEM, nil
 }
@@ -1013,9 +1067,7 @@ func (e *EtcdStressTools) createBaselineAdminNetworkPolicy(ctx context.Context) 
 						"action": "Deny",
 						"from": []map[string]interface{}{
 							{
-								"namespaces": map[string]interface{}{
-									"namespaceSelector": map[string]interface{}{},
-								},
+								"namespaces": map[string]interface{}{},
 							},
 						},
 					},
@@ -1175,10 +1227,8 @@ func (e *EtcdStressTools) createAdminNetworkPolicies(ctx context.Context) error 
 								"to": []map[string]interface{}{
 									{
 										"namespaces": map[string]interface{}{
-											"namespaceSelector": map[string]interface{}{
-												"matchLabels": map[string]interface{}{
-													"kubernetes.io/metadata.name": "openshift-dns",
-												},
+											"matchLabels": map[string]interface{}{
+												"kubernetes.io/metadata.name": "openshift-dns",
 											},
 										},
 									},
@@ -1189,12 +1239,9 @@ func (e *EtcdStressTools) createAdminNetworkPolicies(ctx context.Context) error 
 								"action": "Allow",
 								"to": []map[string]interface{}{
 									{
-										"nodes": map[string]interface{}{
-											"matchExpressions": []map[string]interface{}{
-												{
-													"key":      "node-role.kubernetes.io/control-plane",
-													"operator": "Exists",
-												},
+										"namespaces": map[string]interface{}{
+											"matchLabels": map[string]interface{}{
+												"kubernetes.io/metadata.name": "openshift-kube-apiserver",
 											},
 										},
 									},

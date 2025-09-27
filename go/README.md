@@ -45,7 +45,7 @@ git clone <repository-url>
 cd etcd-stress-tools
 
 # Install dependencies
-go mod download
+go mod tidy
 
 # Build the binary
 go build -o etcd-stress-tools etcd-stress-tools.go
@@ -282,19 +282,8 @@ Consider these etcd settings for better performance during testing:
 - Increase `--quota-backend-bytes`
 - Tune `--heartbeat-interval` and `--election-timeout`
 - Monitor disk I/O and consider faster storage
-
-## Development
-
-### Building from Source
-```bash
-go mod download
-go build -o etcd-stress-tools etcd-stress-tools.go
-```
-
-### Running Tests
-```bash
-go test -v ./...
-```
+### Demo
+[![asciicast](https://asciinema.org/a/745465.svg)](https://asciinema.org/a/745465)
 
 ### Contributing
 1. Fork the repository
@@ -320,3 +309,4 @@ For issues and questions:
 2. Review logs for specific error messages
 3. Verify RBAC permissions
 4. Open an issue with detailed reproduction steps
+

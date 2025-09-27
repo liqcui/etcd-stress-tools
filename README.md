@@ -26,3 +26,8 @@ A high-performance for comprehensive Kubernetes resource creation to stress test
 - **1 BaselineAdminNetworkPolicy (BANP)** (deny-all baseline)
 - **33+ AdminNetworkPolicies (ANP)** (total_namespaces/3, with fake IPs)
 - **500+ Images** (total_namespaces × 5, OpenShift Image resources)
+
+# Analyzer Tools and Reference 
+- [recommended-etcd-practices_recommended-host-practices](https://docs.redhat.com/en/documentation/openshift_container_platform/4.6/html/scalability_and_performance/recommended-host-practices#recommended-etcd-practices_recommended-host-practices) 
+- [How to graph etcd metrics using Prometheus to gauge Etcd performance in OpenShift](https://access.redhat.com/solutions/5489721)
+

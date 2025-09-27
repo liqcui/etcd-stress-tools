@@ -1,0 +1,52 @@
+# FIO Benchmark Analyzer Requirements
+# Install with: pip install -r requirements.txt
+
+# ============================================================================
+# Core LangChain and LangGraph for LLM Integration
+# ============================================================================
+langchain>=0.3.0
+langgraph>=0.3.0
+langchain_community>=0.3.30
+langchain-openai>=0.3.27
+
+# ============================================================================
+# LLM Provider
+# ============================================================================
+openai>=1.0.0
+
+# ============================================================================
+# Database Storage
+# ============================================================================
+duckdb>=0.9.0
+pandas>=2.0.0
+
+# ============================================================================
+# Data Handling and Utilities
+# ============================================================================
+pyyaml>=6.0.0
+python-dateutil>=2.8.0
+typing-extensions>=4.5.0
+python-dotenv>=1.0.0
+
+# ============================================================================
+# Optional: Enhanced Logging and Configuration
+# ============================================================================
+colorlog>=6.7.0
+click>=8.1.0
+
+# ============================================================================
+# Development and Testing (Optional)
+# ============================================================================
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.0.0
+
+# ============================================================================
+# System Requirements (Not Python Packages)
+# ============================================================================
+# - OpenShift CLI (oc) must be installed and configured
+# - Access to OpenShift cluster with master/control-plane node permissions
+# - Podman available on master nodes for FIO container execution
+# - Network access to quay.io/openshift-psap-qe/fio container image

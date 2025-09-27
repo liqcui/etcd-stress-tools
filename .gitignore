@@ -1,3 +1,11 @@
 DATA
 *.log
 etcd-tools
+etcd-stress-tools
+*.html
+*.json
+keysonly.txt
+.DS_Store
+comp.txt
+__pycache__
+fio_benchmarks.duckdb
