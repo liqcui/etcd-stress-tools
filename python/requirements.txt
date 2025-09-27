@@ -1,0 +1,17 @@
+# Kubernetes Python Client
+kubernetes>=28.1.0
+
+# YAML processing
+PyYAML>=6.0.1
+
+# Cryptography for certificate generation
+cryptography>=41.0.0
+
+# Async HTTP client (if needed for custom API calls)
+aiohttp>=3.8.0
+
+# Optional: For better async performance
+uvloop>=0.17.0; sys_platform != "win32"
+
+# Optional: For progress bars
+tqdm>=4.65.0
