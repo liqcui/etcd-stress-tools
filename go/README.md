@@ -13,7 +13,7 @@ This tool creates thousands of Kubernetes resources across multiple namespaces t
 - **3 Large ConfigMaps** - 1MB each (configurable total limit)
 - **10 Small Secrets** - Basic authentication data  
 - **10 Large Secrets** - TLS certificates and large tokens
-- **5 Deployments** (optional) - With mounted ConfigMaps and Secrets
+- **5 Deployments** (optional) - With mounted ConfigMaps and Secrets, validated for pod readiness
 - **2 Network Policies** - Complex ingress/egress rules
 - **1 EgressFirewall** - OVN-Kubernetes egress rules
 
@@ -25,8 +25,10 @@ This tool creates thousands of Kubernetes resources across multiple namespaces t
 ### Performance Features
 - **Parallel Processing** - Configurable concurrent operations
 - **Retry Logic** - Exponential backoff for failed operations
+- **Pod Readiness Validation** - Ensures deployment pods are running and ready before proceeding (120s timeout per deployment)
 - **Resource Limits** - Configurable size limits to prevent cluster overload
-- **Progress Monitoring** - Real-time status updates
+- **Progress Monitoring** - Real-time status updates with pod status tracking
+- **List-Only Mode** - Query and display existing resources without creating new ones
 - **Cleanup Support** - Optional resource cleanup after testing
 
 ## Prerequisites
@@ -71,18 +73,18 @@ podman build -t etcd-stress-tools:latest .
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TOTAL_NAMESPACES` | `100` | Number of namespaces to create |
-| `NAMESPACE_PARALLEL` | `10` | Parallel namespace processing |
+| `NAMESPACE_PARALLEL` | `5` | Parallel namespace processing |
 | `NAMESPACE_PREFIX` | `stress-test` | Prefix for namespace names |
-| `TOTAL_LARGE_CONFIGMAP_LIMIT_GB` | `6` | Total size limit for large ConfigMaps |
+| `TOTAL_LARGE_CONFIGMAP_LIMIT_GB` | `6.0` | Total size limit for large ConfigMaps |
 | `CREATE_DEPLOYMENTS` | `true` | Enable deployment creation |
 | `CREATE_EGRESS_FIREWALL` | `true` | Enable EgressFirewall creation |
 | `CREATE_NETWORK_POLICIES` | `true` | Enable NetworkPolicy creation |
 | `CREATE_ANP_BANP` | `true` | Enable ANP/BANP creation |
 | `CREATE_IMAGES` | `true` | Enable Image creation |
-| `MAX_CONCURRENT_OPERATIONS` | `50` | Maximum concurrent operations |
+| `MAX_CONCURRENT_OPERATIONS` | `20` | Maximum concurrent operations |
 | `NAMESPACE_READY_TIMEOUT` | `60` | Namespace readiness timeout (seconds) |
-| `RESOURCE_RETRY_COUNT` | `3` | Number of retries for failed operations |
-| `RESOURCE_RETRY_DELAY` | `1.0` | Delay between retries (seconds) |
+| `RESOURCE_RETRY_COUNT` | `5` | Number of retries for failed operations |
+| `RESOURCE_RETRY_DELAY` | `2.0` | Base delay between retries (seconds) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 | `CLEANUP_ON_COMPLETION` | `false` | Enable cleanup after completion |
 
@@ -95,14 +97,21 @@ podman build -t etcd-stress-tools:latest .
 Key flags:
 - `--total-namespaces`: Override total namespace count
 - `--namespace-parallel`: Concurrent namespace processing
+- `--namespace-prefix`: Custom prefix for namespace names
 - `--large-limit`: ConfigMap size limit in GB
 - `--enable-deployments`: Force enable deployments
 - `--no-egress-firewall`: Disable EgressFirewall creation
 - `--no-network-policies`: Disable NetworkPolicy creation
 - `--no-anp-banp`: Disable ANP/BANP creation
 - `--no-images`: Disable Image creation
-- `--cleanup`: Enable cleanup after completion
 - `--max-concurrent`: Maximum concurrent operations
+- `--namespace-timeout`: Namespace readiness timeout in seconds
+- `--retry-count`: Number of retries for failed operations
+- `--retry-delay`: Delay between retries in seconds
+- `--cleanup`: Enable cleanup after completion
+- `--list-only`: Only list existing resources without creating new ones
+- `--log-level`: Set logging level
+- `--help`: Show help message
 
 ## Usage Examples
 
@@ -113,13 +122,27 @@ Key flags:
 ./etcd-stress-tools
 
 # Custom namespace count with parallel processing
-./etcd-stress-tools --total-namespaces 50 --namespace-parallel 5
+./etcd-stress-tools --total-namespaces 50 --namespace-parallel 10
 
 # Large scale test with cleanup
 ./etcd-stress-tools --total-namespaces 200 --large-limit 10 --cleanup
 
 # Minimal test (no optional resources)
 ./etcd-stress-tools --total-namespaces 20 --no-images --no-egress-firewall
+```
+
+### List Existing Resources
+
+```bash
+# List all stress-test resources without creating new ones
+./etcd-stress-tools --list-only
+
+# This will display:
+# - Total pods, ConfigMaps, Secrets across namespaces
+# - Breakdown of small vs large resources
+# - NetworkPolicy counts
+# - Image counts
+# - ANP/BANP counts
 ```
 
 ### Environment Variable Configuration
@@ -161,7 +184,7 @@ metadata:
 rules:
 # Core resources
 - apiGroups: [""]
-  resources: ["namespaces", "configmaps", "secrets"]
+  resources: ["namespaces", "configmaps", "secrets", "pods"]
   verbs: ["get", "list", "create", "delete"]
 # Apps
 - apiGroups: ["apps"]
@@ -189,12 +212,20 @@ rules:
 - **Objects Created**: ~40 objects per namespace
 - **Storage Impact**: ~3-4MB per namespace (with large ConfigMaps/Secrets)
 - **Network Policies**: 2 per namespace + global ANP/BANP
+- **Deployments**: 5 per namespace (optional), each with 1 pod replica
 
 ### Total Cluster Impact (100 namespaces)
 - **Total Objects**: ~4,000 Kubernetes objects
+- **Pods**: 500 pods (if deployments enabled)
 - **Storage**: ~300-400MB of etcd data
 - **Images**: 500 Image objects (if enabled)
 - **Global Policies**: 1 BANP + ~33 ANP objects
+
+### Deployment Pod Validation
+- Each deployment waits up to **120 seconds** for pods to become ready
+- Validates pod phase is `Running`
+- Checks pod `Ready` condition is `True`
+- Ensures all replicas are updated and ready
 
 ## Monitoring and Troubleshooting
 
@@ -204,22 +235,42 @@ The tool provides colored, structured logging:
 - **Green**: Successful operations and info messages
 - **Yellow**: Warnings and retries
 - **Red**: Errors and failures
+- **Cyan**: Section headers and summaries
+
+### Pod Readiness Tracking
+
+When deployments are enabled, the tool monitors:
+```
+[DEPLOYMENT] 2025-01-15 10:30:45 - Deployment stress-deployment-1 in namespace stress-test-1 is ready with 1 running pods
+```
 
 ### Common Issues
 
 1. **Namespace Creation Timeout**
    ```
-   Increase NAMESPACE_READY_TIMEOUT or reduce NAMESPACE_PARALLEL
+   Solution: Increase NAMESPACE_READY_TIMEOUT or reduce NAMESPACE_PARALLEL
    ```
 
-2. **Resource Creation Failures**
+2. **Pod Not Ready Timeout**
    ```
-   Check RBAC permissions and cluster resource quotas
+   Error: "timeout waiting for deployment X pods to be ready in namespace Y"
+   Solution: Check pod logs, increase deployment timeout, or verify cluster has sufficient resources
    ```
 
-3. **Out of Memory/Disk Space**
+3. **Resource Creation Failures**
    ```
-   Reduce TOTAL_NAMESPACES or disable large ConfigMaps
+   Solution: Check RBAC permissions and cluster resource quotas
+   ```
+
+4. **Out of Memory/Disk Space**
+   ```
+   Solution: Reduce TOTAL_NAMESPACES or disable large ConfigMaps
+   ```
+
+5. **Connection Errors**
+   ```
+   The tool automatically retries on connection errors with exponential backoff
+   Check: "connection reset by peer", "timeout", "EOF", "http2" errors in logs
    ```
 
 ### Monitoring etcd Performance
@@ -235,6 +286,9 @@ kubectl get events --sort-by=.metadata.creationTimestamp
 
 # Resource usage
 kubectl get all --all-namespaces | wc -l
+
+# Pod status
+kubectl get pods --all-namespaces -l stress-test=true
 ```
 
 ## Cleanup
@@ -249,7 +303,7 @@ export CLEANUP_ON_COMPLETION=true
 
 ### Manual Cleanup
 ```bash
-# Delete all stress test namespaces
+# Delete all stress test namespaces (includes all resources within)
 kubectl delete namespaces -l stress-test=true
 
 # Delete global network policies
@@ -267,6 +321,7 @@ oc delete images -l stress-test=true
 export NAMESPACE_PARALLEL=20
 export MAX_CONCURRENT_OPERATIONS=100
 export TOTAL_NAMESPACES=500
+export RESOURCE_RETRY_COUNT=3
 ```
 
 ### For Resource-Constrained Environments
@@ -275,17 +330,29 @@ export NAMESPACE_PARALLEL=5
 export MAX_CONCURRENT_OPERATIONS=20
 export CREATE_DEPLOYMENTS=false
 export CREATE_IMAGES=false
+export TOTAL_NAMESPACES=50
 ```
+
+### Optimizing Deployment Creation
+- **Reduce parallel operations** if pods fail to schedule due to resource constraints
+- **Monitor node resources** to ensure sufficient CPU/memory for pods
+- **Consider disabling deployments** for pure etcd stress testing without pod overhead
+- Deployment pod readiness timeout is fixed at 120s per deployment
 
 ### etcd Optimization
 Consider these etcd settings for better performance during testing:
-- Increase `--quota-backend-bytes`
+- Increase `--quota-backend-bytes` (default 2GB, consider 8GB+ for large tests)
 - Tune `--heartbeat-interval` and `--election-timeout`
-- Monitor disk I/O and consider faster storage
-### Demo
+- Monitor disk I/O and consider faster storage (NVMe recommended)
+- Enable etcd metrics and monitor:
+  - `etcd_disk_backend_commit_duration_seconds`
+  - `etcd_disk_wal_fsync_duration_seconds`
+  - `etcd_server_has_leader`
+
+## Demo
 [![asciicast](https://asciinema.org/a/745465.svg)](https://asciinema.org/a/745465)
 
-### Contributing
+## Contributing
 1. Fork the repository
 2. Create a feature branch
 3. Make changes and add tests
@@ -301,12 +368,22 @@ Consider these etcd settings for better performance during testing:
 - Ensure proper RBAC is configured to limit access
 - Monitor cluster resources during testing to prevent overload
 - Always clean up resources after testing to prevent resource exhaustion
+- The tool validates pod readiness but does not validate application functionality
+- Large-scale testing can impact cluster performance for other workloads
 
 ## Support
 
 For issues and questions:
 1. Check the [troubleshooting section](#monitoring-and-troubleshooting)
 2. Review logs for specific error messages
-3. Verify RBAC permissions
-4. Open an issue with detailed reproduction steps
+3. Verify RBAC permissions (especially for pods list/get)
+4. Check pod status if deployment creation fails
+5. Open an issue with detailed reproduction steps and logs
 
+## Changelog
+
+### Latest Updates
+- **Pod Readiness Validation**: Deployments now wait for pods to be running and ready
+- **Enhanced Monitoring**: Real-time pod status tracking during deployment creation
+- **Improved Error Handling**: Better retry logic for connection errors and transient failures
+- **List-Only Mode**: Query existing resources without creating new ones

@@ -16,9 +16,11 @@ import (
 	mathrand "math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -49,41 +51,54 @@ const (
 
 // Config holds all configuration options
 type Config struct {
-	// Core namespace configuration
-	TotalNamespaces   int
-	NamespaceParallel int
-	NamespacePrefix   string
-
-	// ConfigMap and Secret counts
+	TotalNamespaces            int
+	NamespaceParallel          int
+	NamespacePrefix            string
 	SmallConfigMapsPerNS       int
 	LargeConfigMapsPerNS       int
 	LargeConfigMapSizeMB       float64
 	TotalLargeConfigMapLimitGB float64
+	SmallSecretsPerNS          int
+	LargeSecretsPerNS          int
+	CreateDeployments          bool
+	DeploymentsPerNS           int
+	CreateEgressFirewall       bool
+	CreateNetworkPolicies      bool
+	CreateANPBANP              bool
+	CreateImages               bool
+	MaxConcurrentOperations    int
+	NamespaceReadyTimeout      time.Duration
+	ResourceRetryCount         int
+	ResourceRetryDelay         time.Duration
+	LogLevel                   string
+	CleanupOnCompletion        bool
+	ListOnly                   bool
+}
 
-	SmallSecretsPerNS int
-	LargeSecretsPerNS int
+// ResourceStats holds statistics for listing operations
+type ResourceStats struct {
+	TotalPods       int
+	TotalConfigMaps int
+	SmallConfigMaps int
+	LargeConfigMaps int
+	TotalSecrets    int
+	SmallSecrets    int
+	LargeSecrets    int
+	TotalNamespaces int
+	Details         map[string]NamespaceDetails
+}
 
-	// Optional features
-	CreateDeployments     bool
-	DeploymentsPerNS      int
-	CreateEgressFirewall  bool
-	CreateNetworkPolicies bool
-	CreateANPBANP         bool
-	CreateImages          bool
-
-	// Performance tuning
-	MaxConcurrentOperations int
-
-	// Timeouts and retries
-	NamespaceReadyTimeout time.Duration
-	ResourceRetryCount    int
-	ResourceRetryDelay    time.Duration
-
-	// Logging
-	LogLevel string
-
-	// Cleanup
-	CleanupOnCompletion bool
+// NamespaceDetails holds per-namespace resource details
+type NamespaceDetails struct {
+	PodCount           int
+	ConfigMapCount     int
+	SmallConfigMaps    int
+	LargeConfigMaps    int
+	SecretCount        int
+	SmallSecrets       int
+	LargeSecrets       int
+	DeploymentCount    int
+	NetworkPolicyCount int
 }
 
 // EtcdStressTools is the main struct for the stress testing tool
@@ -99,7 +114,7 @@ type EtcdStressTools struct {
 func NewConfig() *Config {
 	config := &Config{
 		TotalNamespaces:            getEnvInt("TOTAL_NAMESPACES", 100),
-		NamespaceParallel:          getEnvInt("NAMESPACE_PARALLEL", 5), // Reduced from 10
+		NamespaceParallel:          getEnvInt("NAMESPACE_PARALLEL", 5),
 		NamespacePrefix:            getEnvString("NAMESPACE_PREFIX", "stress-test"),
 		SmallConfigMapsPerNS:       10,
 		LargeConfigMapsPerNS:       3,
@@ -108,17 +123,18 @@ func NewConfig() *Config {
 		SmallSecretsPerNS:          10,
 		LargeSecretsPerNS:          10,
 		CreateDeployments:          getEnvBool("CREATE_DEPLOYMENTS", true),
-		DeploymentsPerNS:           5,
+		DeploymentsPerNS:           3,
 		CreateEgressFirewall:       getEnvBool("CREATE_EGRESS_FIREWALL", true),
 		CreateNetworkPolicies:      getEnvBool("CREATE_NETWORK_POLICIES", true),
 		CreateANPBANP:              getEnvBool("CREATE_ANP_BANP", true),
 		CreateImages:               getEnvBool("CREATE_IMAGES", true),
-		MaxConcurrentOperations:    getEnvInt("MAX_CONCURRENT_OPERATIONS", 20), // Reduced from 50
+		MaxConcurrentOperations:    getEnvInt("MAX_CONCURRENT_OPERATIONS", 20),
 		NamespaceReadyTimeout:      time.Duration(getEnvInt("NAMESPACE_READY_TIMEOUT", 60)) * time.Second,
-		ResourceRetryCount:         getEnvInt("RESOURCE_RETRY_COUNT", 5),                                            // Increased from 3
-		ResourceRetryDelay:         time.Duration(getEnvFloat("RESOURCE_RETRY_DELAY", 2.0)*1000) * time.Millisecond, // Increased from 1.0
+		ResourceRetryCount:         getEnvInt("RESOURCE_RETRY_COUNT", 5),
+		ResourceRetryDelay:         time.Duration(getEnvFloat("RESOURCE_RETRY_DELAY", 2.0)*1000) * time.Millisecond,
 		LogLevel:                   getEnvString("LOG_LEVEL", "INFO"),
 		CleanupOnCompletion:        getEnvBool("CLEANUP_ON_COMPLETION", false),
+		ListOnly:                   false,
 	}
 	return config
 }
@@ -178,7 +194,6 @@ func (e *EtcdStressTools) setupKubernetesClients() error {
 	var config *rest.Config
 	var err error
 
-	// Try in-cluster config first, then kubeconfig
 	if config, err = rest.InClusterConfig(); err != nil {
 		if config, err = clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile); err != nil {
 			return fmt.Errorf("failed to create Kubernetes config: %w", err)
@@ -188,12 +203,10 @@ func (e *EtcdStressTools) setupKubernetesClients() error {
 		e.logInfo("Using in-cluster Kubernetes configuration", "MAIN")
 	}
 
-	// Configure client for high-load scenarios
-	config.QPS = 50.0                 // Moderate queries per second
-	config.Burst = 100                // Moderate burst capacity
-	config.Timeout = 60 * time.Second // Increase timeout
+	config.QPS = 50.0
+	config.Burst = 100
+	config.Timeout = 60 * time.Second
 
-	// Use a custom dialer for timeouts/keepalives; keep client-go's TLS-aware transport
 	config.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
 		d := &net.Dialer{
 			Timeout:   30 * time.Second,
@@ -202,13 +215,11 @@ func (e *EtcdStressTools) setupKubernetesClients() error {
 		return d.DialContext(ctx, network, address)
 	}
 
-	// Create clientset
 	e.clientset, err = kubernetes.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("failed to create Kubernetes clientset: %w", err)
 	}
 
-	// Create dynamic client
 	e.dynamicClient, err = dynamic.NewForConfig(config)
 	if err != nil {
 		return fmt.Errorf("failed to create dynamic client: %w", err)
@@ -239,7 +250,6 @@ func (e *EtcdStressTools) logError(message, component string) {
 
 // ensureNamespace creates a namespace with custom labels and waits for it to be ready
 func (e *EtcdStressTools) ensureNamespace(ctx context.Context, namespaceName string, labels map[string]string) error {
-	// Check if namespace exists
 	if _, err := e.clientset.CoreV1().Namespaces().Get(ctx, namespaceName, metav1.GetOptions{}); err == nil {
 		e.logInfo(fmt.Sprintf("Namespace %s already exists", namespaceName), "NAMESPACE")
 		return e.waitUntilNamespaceReady(ctx, namespaceName)
@@ -247,7 +257,6 @@ func (e *EtcdStressTools) ensureNamespace(ctx context.Context, namespaceName str
 		return fmt.Errorf("error checking namespace %s: %w", namespaceName, err)
 	}
 
-	// Create namespace
 	if labels == nil {
 		labels = make(map[string]string)
 	}
@@ -298,7 +307,6 @@ func (e *EtcdStressTools) waitUntilNamespaceReady(ctx context.Context, namespace
 				continue
 			}
 
-			// Test namespace readiness with a dummy ConfigMap
 			testCMName := fmt.Sprintf("test-readiness-%d", time.Now().Unix())
 			testCM := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -316,9 +324,7 @@ func (e *EtcdStressTools) waitUntilNamespaceReady(ctx context.Context, namespace
 				return nil
 			}
 
-			// Clean up test resource
 			e.clientset.CoreV1().ConfigMaps(namespaceName).Delete(ctx, testCMName, metav1.DeleteOptions{})
-
 			e.logInfo(fmt.Sprintf("Namespace %s is ready for resource creation", namespaceName), "NAMESPACE")
 			return nil
 		}
@@ -333,13 +339,11 @@ func (e *EtcdStressTools) retryResourceOperation(ctx context.Context, operation 
 		if err := operation(); err != nil {
 			lastErr = err
 
-			// Check for specific error types that should be retried
 			if apierrors.IsServerTimeout(err) ||
 				apierrors.IsTooManyRequests(err) ||
 				apierrors.IsServiceUnavailable(err) ||
 				isConnectionError(err) {
 				if attempt < e.config.ResourceRetryCount {
-					// Exponential backoff with jitter
 					baseDelay := e.config.ResourceRetryDelay * time.Duration(1<<uint(attempt))
 					jitter := time.Duration(mathrand.Int63n(int64(baseDelay / 2)))
 					waitTime := baseDelay + jitter
@@ -367,7 +371,6 @@ func (e *EtcdStressTools) retryResourceOperation(ctx context.Context, operation 
 			} else if apierrors.IsAlreadyExists(err) {
 				return nil
 			} else {
-				// Don't retry other errors
 				break
 			}
 		} else {
@@ -459,7 +462,6 @@ func (e *EtcdStressTools) createSmallConfigMaps(ctx context.Context, namespace s
 
 // createLargeConfigMaps creates 3 large ConfigMaps with 1MB size each
 func (e *EtcdStressTools) createLargeConfigMaps(ctx context.Context, namespace string) error {
-	// Check if we exceed the total limit
 	totalLargeConfigMaps := e.config.TotalNamespaces * e.config.LargeConfigMapsPerNS
 	totalSizeGB := float64(totalLargeConfigMaps) * e.config.LargeConfigMapSizeMB / 1024
 
@@ -482,7 +484,7 @@ func (e *EtcdStressTools) createLargeConfigMaps(ctx context.Context, namespace s
 
 			name := fmt.Sprintf("large-cm-%d", index+1)
 			sizeBytes := int(e.config.LargeConfigMapSizeMB * 1024 * 1024)
-			dataSize := sizeBytes - 1024 // Reserve space for keys and metadata
+			dataSize := sizeBytes - 1024
 
 			configMap := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -537,7 +539,6 @@ func (e *EtcdStressTools) createSmallSecrets(ctx context.Context, namespace stri
 
 			name := fmt.Sprintf("small-secret-%d", index+1)
 
-			// Generate random data
 			userBytes := make([]byte, 8)
 			passBytes := make([]byte, 16)
 			tokenBytes := make([]byte, 32)
@@ -587,13 +588,11 @@ func (e *EtcdStressTools) createSmallSecrets(ctx context.Context, namespace stri
 
 // generateKeyPair generates RSA keypair and certificate
 func generateKeyPair() (privateKeyPEM, publicKeyPEM, certificatePEM string, err error) {
-	// Generate RSA key
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return "", "", "", err
 	}
 
-	// Encode private key to PEM format
 	privateKeyDER := x509.MarshalPKCS1PrivateKey(privateKey)
 	privateKeyBlock := &pem.Block{
 		Type:  "RSA PRIVATE KEY",
@@ -601,12 +600,10 @@ func generateKeyPair() (privateKeyPEM, publicKeyPEM, certificatePEM string, err 
 	}
 	privateKeyPEM = string(pem.EncodeToMemory(privateKeyBlock))
 
-	// Generate public key in SSH format (simplified)
 	publicKeyBytes := make([]byte, 256)
 	rand.Read(publicKeyBytes)
 	publicKeyPEM = base64.StdEncoding.EncodeToString(publicKeyBytes)
 
-	// Generate self-signed certificate
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
@@ -649,7 +646,6 @@ func (e *EtcdStressTools) createLargeSecrets(ctx context.Context, namespace stri
 
 			name := fmt.Sprintf("large-secret-%d", index+1)
 
-			// Generate certificate and key data
 			privateKey, publicKey, certificate, err := generateKeyPair()
 			if err != nil {
 				mu.Lock()
@@ -658,7 +654,6 @@ func (e *EtcdStressTools) createLargeSecrets(ctx context.Context, namespace stri
 				return
 			}
 
-			// Generate large token
 			largeTokenBytes := make([]byte, 1024)
 			rand.Read(largeTokenBytes)
 
@@ -704,6 +699,70 @@ func (e *EtcdStressTools) createLargeSecrets(ctx context.Context, namespace stri
 	return nil
 }
 
+// waitForDeploymentReady waits for a deployment's pods to be running and ready
+func (e *EtcdStressTools) waitForDeploymentReady(ctx context.Context, namespace, deploymentName string, timeout time.Duration) error {
+	timeoutTimer := time.NewTimer(timeout)
+	defer timeoutTimer.Stop()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeoutTimer.C:
+			return fmt.Errorf("timeout waiting for deployment %s pods to be ready in namespace %s", deploymentName, namespace)
+		case <-ticker.C:
+			deployment, err := e.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					continue
+				}
+				return fmt.Errorf("error getting deployment %s: %w", deploymentName, err)
+			}
+
+			if deployment.Status.ReadyReplicas == *deployment.Spec.Replicas &&
+				deployment.Status.UpdatedReplicas == *deployment.Spec.Replicas &&
+				deployment.Status.Replicas == *deployment.Spec.Replicas {
+
+				pods, err := e.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+					LabelSelector: fmt.Sprintf("app=%s", deploymentName),
+				})
+				if err != nil {
+					return fmt.Errorf("error listing pods for deployment %s: %w", deploymentName, err)
+				}
+
+				allPodsReady := true
+				for _, pod := range pods.Items {
+					if pod.Status.Phase != corev1.PodRunning {
+						allPodsReady = false
+						break
+					}
+
+					podReady := false
+					for _, condition := range pod.Status.Conditions {
+						if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+							podReady = true
+							break
+						}
+					}
+					if !podReady {
+						allPodsReady = false
+						break
+					}
+				}
+
+				if allPodsReady && len(pods.Items) > 0 {
+					e.logInfo(fmt.Sprintf("Deployment %s in namespace %s is ready with %d running pods",
+						deploymentName, namespace, len(pods.Items)), "DEPLOYMENT")
+					return nil
+				}
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 // createDeployments creates 5 deployments with mounted ConfigMaps and Secrets
 func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace string) error {
 	if !e.config.CreateDeployments {
@@ -724,11 +783,9 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 
 			name := fmt.Sprintf("stress-deployment-%d", index+1)
 
-			// Create volume mounts
 			var volumes []corev1.Volume
 			var volumeMounts []corev1.VolumeMount
 
-			// Mount 5 small configmaps
 			for j := 0; j < 5; j++ {
 				cmName := fmt.Sprintf("small-cm-%d", j+1)
 				volumeName := fmt.Sprintf("small-cm-%d", j)
@@ -746,7 +803,6 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 				})
 			}
 
-			// Mount 1 large configmap
 			volumes = append(volumes, corev1.Volume{
 				Name: "large-cm-0",
 				VolumeSource: corev1.VolumeSource{
@@ -760,7 +816,6 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 				MountPath: "/config/large-cm/0",
 			})
 
-			// Mount 5 small secrets
 			for j := 0; j < 5; j++ {
 				secretName := fmt.Sprintf("small-secret-%d", j+1)
 				volumeName := fmt.Sprintf("small-secret-%d", j)
@@ -778,7 +833,6 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 				})
 			}
 
-			// Mount 5 large secrets
 			for j := 0; j < 5; j++ {
 				secretName := fmt.Sprintf("large-secret-%d", j+1)
 				volumeName := fmt.Sprintf("large-secret-%d", j)
@@ -796,7 +850,6 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 				})
 			}
 
-			// Create deployment spec
 			deployment := &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      name,
@@ -853,6 +906,16 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 				errors = append(errors, fmt.Errorf("failed to create Deployment %s in %s: %w", name, namespace, err))
 				mu.Unlock()
 				e.logWarn(fmt.Sprintf("Failed to create Deployment %s in %s: %v", name, namespace, err), "DEPLOYMENT")
+				return
+			}
+
+			// Wait for deployment pods to be ready
+			waitTimeout := 120 * time.Second
+			if err := e.waitForDeploymentReady(ctx, namespace, name, waitTimeout); err != nil {
+				mu.Lock()
+				errors = append(errors, fmt.Errorf("deployment %s created but pods not ready in %s: %w", name, namespace, err))
+				mu.Unlock()
+				e.logWarn(fmt.Sprintf("Deployment %s created but pods not ready in %s: %v", name, namespace, err), "DEPLOYMENT")
 			}
 		}(i)
 	}
@@ -924,7 +987,6 @@ func (e *EtcdStressTools) createNetworkPolicies(ctx context.Context, namespace s
 		return nil
 	}
 
-	// Policy 1: Deny by default
 	denyPolicy := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "deny-by-default",
@@ -938,7 +1000,6 @@ func (e *EtcdStressTools) createNetworkPolicies(ctx context.Context, namespace s
 		},
 	}
 
-	// Policy 2: Large network policy with complex rules
 	largePolicy := &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "large-networkpolicy-egress-allow-dns",
@@ -995,7 +1056,6 @@ func (e *EtcdStressTools) createNetworkPolicies(ctx context.Context, namespace s
 		},
 	}
 
-	// Create both policies
 	err := e.retryResourceOperation(ctx, func() error {
 		_, err := e.clientset.NetworkingV1().NetworkPolicies(namespace).Create(ctx, denyPolicy, metav1.CreateOptions{})
 		return err
@@ -1019,7 +1079,6 @@ func (e *EtcdStressTools) createNetworkPolicies(ctx context.Context, namespace s
 func (e *EtcdStressTools) generateFakeIPs(count int) []string {
 	ips := make([]string, count)
 	for i := 0; i < count; i++ {
-		// Generate random private IP addresses
 		octets := []int{
 			[]int{10, 172, 192}[mathrand.Intn(3)],
 			mathrand.Intn(255) + 1,
@@ -1339,7 +1398,6 @@ func (e *EtcdStressTools) createImages(ctx context.Context) error {
 	return nil
 }
 
-// Helper function for max (Go 1.18+ has this built-in)
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -1352,16 +1410,13 @@ func (e *EtcdStressTools) createNamespaceResources(ctx context.Context, namespac
 	namespaceName := fmt.Sprintf("%s-%d", e.config.NamespacePrefix, namespaceIdx)
 	tenant := e.tenantLabels[namespaceIdx%len(e.tenantLabels)]
 
-	// Create namespace with appropriate labels
 	namespaceLabels := map[string]string{
 		"customer_tenant": tenant,
 	}
-	// Add anplabel to some namespaces for BANP testing
 	if namespaceIdx%4 == 0 {
 		namespaceLabels["anplabel"] = "anp-tenant"
 	}
 
-	// Step 1: Ensure namespace exists and is ready
 	if err := e.ensureNamespace(ctx, namespaceName, namespaceLabels); err != nil {
 		e.logError(fmt.Sprintf("Failed to create/verify namespace %s: %v", namespaceName, err), "NAMESPACE")
 		return 0, 1
@@ -1369,7 +1424,6 @@ func (e *EtcdStressTools) createNamespaceResources(ctx context.Context, namespac
 
 	var successCount, errorCount int
 
-	// Step 2: Create ConfigMaps and Secrets (required for deployments)
 	resourceFuncs := []struct {
 		name string
 		fn   func(context.Context, string) error
@@ -1389,7 +1443,6 @@ func (e *EtcdStressTools) createNamespaceResources(ctx context.Context, namespac
 		}
 	}
 
-	// Step 3: Create additional resources
 	additionalFuncs := []struct {
 		name string
 		fn   func(context.Context, string) error
@@ -1450,19 +1503,411 @@ func (e *EtcdStressTools) createGlobalNetworkPolicies(ctx context.Context) {
 
 	e.logInfo("Creating global network policies", "NETPOL")
 
-	// Create BaselineAdminNetworkPolicy
 	if err := e.createBaselineAdminNetworkPolicy(ctx); err != nil {
 		e.logWarn(fmt.Sprintf("Failed to create BANP: %v", err), "BANP")
 	} else {
 		e.logInfo("BaselineAdminNetworkPolicy created successfully", "BANP")
 	}
 
-	// Create AdminNetworkPolicies
 	if err := e.createAdminNetworkPolicies(ctx); err != nil {
 		e.logWarn(fmt.Sprintf("Failed to create ANPs: %v", err), "ANP")
 	} else {
 		e.logInfo("AdminNetworkPolicies created successfully", "ANP")
 	}
+}
+
+// LIST FUNCTIONS
+
+// listAllPods lists all pods across stress-test namespaces
+func (e *EtcdStressTools) listAllPods(ctx context.Context) (*ResourceStats, error) {
+	e.logInfo("Listing all pods in stress-test namespaces", "LIST-PODS")
+
+	namespaces, err := e.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{
+		LabelSelector: "stress-test=true",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+
+	stats := &ResourceStats{
+		Details: make(map[string]NamespaceDetails),
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, e.config.NamespaceParallel)
+
+	for _, ns := range namespaces.Items {
+		wg.Add(1)
+		go func(nsName string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			pods, err := e.clientset.CoreV1().Pods(nsName).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				e.logWarn(fmt.Sprintf("Failed to list pods in %s: %v", nsName, err), "LIST-PODS")
+				return
+			}
+
+			mu.Lock()
+			stats.TotalPods += len(pods.Items)
+			if _, exists := stats.Details[nsName]; !exists {
+				stats.Details[nsName] = NamespaceDetails{}
+			}
+			detail := stats.Details[nsName]
+			detail.PodCount = len(pods.Items)
+			stats.Details[nsName] = detail
+			mu.Unlock()
+		}(ns.Name)
+	}
+
+	wg.Wait()
+	stats.TotalNamespaces = len(namespaces.Items)
+
+	e.logInfo(fmt.Sprintf("Total pods found: %d across %d namespaces", stats.TotalPods, stats.TotalNamespaces), "LIST-PODS")
+	return stats, nil
+}
+
+// listAllConfigMaps lists all ConfigMaps across stress-test namespaces
+func (e *EtcdStressTools) listAllConfigMaps(ctx context.Context) (*ResourceStats, error) {
+	e.logInfo("Listing all ConfigMaps in stress-test namespaces", "LIST-CM")
+
+	namespaces, err := e.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{
+		LabelSelector: "stress-test=true",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+
+	stats := &ResourceStats{
+		Details: make(map[string]NamespaceDetails),
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, e.config.NamespaceParallel)
+
+	for _, ns := range namespaces.Items {
+		wg.Add(1)
+		go func(nsName string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			configMaps, err := e.clientset.CoreV1().ConfigMaps(nsName).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				e.logWarn(fmt.Sprintf("Failed to list ConfigMaps in %s: %v", nsName, err), "LIST-CM")
+				return
+			}
+
+			var smallCount, largeCount int
+			for _, cm := range configMaps.Items {
+				if cm.Labels["type"] == "small-configmap" {
+					smallCount++
+				} else if cm.Labels["type"] == "large-configmap" {
+					largeCount++
+				}
+			}
+
+			mu.Lock()
+			stats.TotalConfigMaps += len(configMaps.Items)
+			stats.SmallConfigMaps += smallCount
+			stats.LargeConfigMaps += largeCount
+			if _, exists := stats.Details[nsName]; !exists {
+				stats.Details[nsName] = NamespaceDetails{}
+			}
+			detail := stats.Details[nsName]
+			detail.ConfigMapCount = len(configMaps.Items)
+			detail.SmallConfigMaps = smallCount
+			detail.LargeConfigMaps = largeCount
+			stats.Details[nsName] = detail
+			mu.Unlock()
+		}(ns.Name)
+	}
+
+	wg.Wait()
+	stats.TotalNamespaces = len(namespaces.Items)
+
+	e.logInfo(fmt.Sprintf("Total ConfigMaps: %d (Small: %d, Large: %d)", stats.TotalConfigMaps, stats.SmallConfigMaps, stats.LargeConfigMaps), "LIST-CM")
+	return stats, nil
+}
+
+// listAllSecrets lists all Secrets across stress-test namespaces
+func (e *EtcdStressTools) listAllSecrets(ctx context.Context) (*ResourceStats, error) {
+	e.logInfo("Listing all Secrets in stress-test namespaces", "LIST-SECRET")
+
+	namespaces, err := e.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{
+		LabelSelector: "stress-test=true",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+
+	stats := &ResourceStats{
+		Details: make(map[string]NamespaceDetails),
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, e.config.NamespaceParallel)
+
+	for _, ns := range namespaces.Items {
+		wg.Add(1)
+		go func(nsName string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			secrets, err := e.clientset.CoreV1().Secrets(nsName).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				e.logWarn(fmt.Sprintf("Failed to list Secrets in %s: %v", nsName, err), "LIST-SECRET")
+				return
+			}
+
+			var smallCount, largeCount int
+			for _, secret := range secrets.Items {
+				if secret.Labels["type"] == "small-secret" {
+					smallCount++
+				} else if secret.Labels["type"] == "large-secret" {
+					largeCount++
+				}
+			}
+
+			mu.Lock()
+			stats.TotalSecrets += len(secrets.Items)
+			stats.SmallSecrets += smallCount
+			stats.LargeSecrets += largeCount
+			if _, exists := stats.Details[nsName]; !exists {
+				stats.Details[nsName] = NamespaceDetails{}
+			}
+			detail := stats.Details[nsName]
+			detail.SecretCount = len(secrets.Items)
+			detail.SmallSecrets = smallCount
+			detail.LargeSecrets = largeCount
+			stats.Details[nsName] = detail
+			mu.Unlock()
+		}(ns.Name)
+	}
+
+	wg.Wait()
+	stats.TotalNamespaces = len(namespaces.Items)
+
+	e.logInfo(fmt.Sprintf("Total Secrets: %d (Small: %d, Large: %d)", stats.TotalSecrets, stats.SmallSecrets, stats.LargeSecrets), "LIST-SECRET")
+	return stats, nil
+}
+
+// listAllNetworkPolicies lists all NetworkPolicies across stress-test namespaces
+func (e *EtcdStressTools) listAllNetworkPolicies(ctx context.Context) (*ResourceStats, error) {
+	e.logInfo("Listing all NetworkPolicies in stress-test namespaces", "LIST-NETPOL")
+
+	namespaces, err := e.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{
+		LabelSelector: "stress-test=true",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list namespaces: %w", err)
+	}
+
+	stats := &ResourceStats{
+		Details: make(map[string]NamespaceDetails),
+	}
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, e.config.NamespaceParallel)
+
+	for _, ns := range namespaces.Items {
+		wg.Add(1)
+		go func(nsName string) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			netpols, err := e.clientset.NetworkingV1().NetworkPolicies(nsName).List(ctx, metav1.ListOptions{
+				LabelSelector: "stress-test=true",
+			})
+			if err != nil {
+				e.logWarn(fmt.Sprintf("Failed to list NetworkPolicies in %s: %v", nsName, err), "LIST-NETPOL")
+				return
+			}
+
+			mu.Lock()
+			if _, exists := stats.Details[nsName]; !exists {
+				stats.Details[nsName] = NamespaceDetails{}
+			}
+			detail := stats.Details[nsName]
+			detail.NetworkPolicyCount = len(netpols.Items)
+			stats.Details[nsName] = detail
+			mu.Unlock()
+		}(ns.Name)
+	}
+
+	wg.Wait()
+	stats.TotalNamespaces = len(namespaces.Items)
+
+	totalNetPols := 0
+	for _, detail := range stats.Details {
+		totalNetPols += detail.NetworkPolicyCount
+	}
+
+	e.logInfo(fmt.Sprintf("Total NetworkPolicies: %d across %d namespaces", totalNetPols, stats.TotalNamespaces), "LIST-NETPOL")
+	return stats, nil
+}
+
+// listAllImages lists all Images (OpenShift specific)
+func (e *EtcdStressTools) listAllImages(ctx context.Context) (int, error) {
+	e.logInfo("Listing all Images with stress-test label", "LIST-IMAGE")
+
+	imageGVR := schema.GroupVersionResource{
+		Group:    "image.openshift.io",
+		Version:  "v1",
+		Resource: "images",
+	}
+
+	images, err := e.dynamicClient.Resource(imageGVR).List(ctx, metav1.ListOptions{
+		LabelSelector: "stress-test=true",
+	})
+	if err != nil {
+		e.logWarn(fmt.Sprintf("Failed to list Images: %v", err), "LIST-IMAGE")
+		return 0, err
+	}
+
+	imageCount := len(images.Items)
+	e.logInfo(fmt.Sprintf("Total Images: %d", imageCount), "LIST-IMAGE")
+	return imageCount, nil
+}
+
+// listAllAdminNetworkPolicies lists all ANP and BANP objects
+func (e *EtcdStressTools) listAllAdminNetworkPolicies(ctx context.Context) (int, int, error) {
+	e.logInfo("Listing AdminNetworkPolicies and BaselineAdminNetworkPolicies", "LIST-ANP")
+
+	anpGVR := schema.GroupVersionResource{
+		Group:    "policy.networking.k8s.io",
+		Version:  "v1alpha1",
+		Resource: "adminnetworkpolicies",
+	}
+
+	banpGVR := schema.GroupVersionResource{
+		Group:    "policy.networking.k8s.io",
+		Version:  "v1alpha1",
+		Resource: "baselineadminnetworkpolicies",
+	}
+
+	anps, err := e.dynamicClient.Resource(anpGVR).List(ctx, metav1.ListOptions{
+		LabelSelector: "stress-test=true",
+	})
+	anpCount := 0
+	if err != nil {
+		e.logWarn(fmt.Sprintf("Failed to list AdminNetworkPolicies: %v", err), "LIST-ANP")
+	} else {
+		anpCount = len(anps.Items)
+	}
+
+	banps, err := e.dynamicClient.Resource(banpGVR).List(ctx, metav1.ListOptions{
+		LabelSelector: "stress-test=true",
+	})
+	banpCount := 0
+	if err != nil {
+		e.logWarn(fmt.Sprintf("Failed to list BaselineAdminNetworkPolicies: %v", err), "LIST-ANP")
+	} else {
+		banpCount = len(banps.Items)
+	}
+
+	e.logInfo(fmt.Sprintf("Total AdminNetworkPolicies: %d, BaselineAdminNetworkPolicies: %d", anpCount, banpCount), "LIST-ANP")
+	return anpCount, banpCount, nil
+}
+
+// runListScenario runs the comprehensive listing scenario
+func (e *EtcdStressTools) runListScenario(ctx context.Context) error {
+	e.logInfo("Starting list scenario for large-scale resources", "LIST")
+	startTime := time.Now()
+
+	var wg sync.WaitGroup
+	var podStats, cmStats, secretStats, netpolStats *ResourceStats
+	var podErr, cmErr, secretErr, netpolErr error
+	var imageCount, anpCount, banpCount int
+	var imageErr, anpErr error
+
+	wg.Add(6)
+	go func() {
+		defer wg.Done()
+		podStats, podErr = e.listAllPods(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		cmStats, cmErr = e.listAllConfigMaps(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		secretStats, secretErr = e.listAllSecrets(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		netpolStats, netpolErr = e.listAllNetworkPolicies(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		imageCount, imageErr = e.listAllImages(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		anpCount, banpCount, anpErr = e.listAllAdminNetworkPolicies(ctx)
+	}()
+
+	wg.Wait()
+
+	fmt.Printf("\n%s%s%s\n", ColorCyan, strings.Repeat("=", 80), ColorNC)
+	fmt.Printf("%sResource Listing Summary%s\n", ColorGreen, ColorNC)
+	fmt.Printf("%s%s%s\n", ColorCyan, strings.Repeat("=", 80), ColorNC)
+
+	if podErr == nil && podStats != nil {
+		fmt.Printf("\n%sPods:%s\n", ColorYellow, ColorNC)
+		fmt.Printf("  Total Pods: %d\n", podStats.TotalPods)
+		fmt.Printf("  Namespaces: %d\n", podStats.TotalNamespaces)
+	}
+
+	if cmErr == nil && cmStats != nil {
+		fmt.Printf("\n%sConfigMaps:%s\n", ColorYellow, ColorNC)
+		fmt.Printf("  Total ConfigMaps: %d\n", cmStats.TotalConfigMaps)
+		fmt.Printf("  Small ConfigMaps: %d\n", cmStats.SmallConfigMaps)
+		fmt.Printf("  Large ConfigMaps: %d\n", cmStats.LargeConfigMaps)
+		fmt.Printf("  Namespaces: %d\n", cmStats.TotalNamespaces)
+	}
+
+	if secretErr == nil && secretStats != nil {
+		fmt.Printf("\n%sSecrets:%s\n", ColorYellow, ColorNC)
+		fmt.Printf("  Total Secrets: %d\n", secretStats.TotalSecrets)
+		fmt.Printf("  Small Secrets: %d\n", secretStats.SmallSecrets)
+		fmt.Printf("  Large Secrets: %d\n", secretStats.LargeSecrets)
+		fmt.Printf("  Namespaces: %d\n", secretStats.TotalNamespaces)
+	}
+
+	if netpolErr == nil && netpolStats != nil {
+		totalNetPols := 0
+		for _, detail := range netpolStats.Details {
+			totalNetPols += detail.NetworkPolicyCount
+		}
+		fmt.Printf("\n%sNetworkPolicies:%s\n", ColorYellow, ColorNC)
+		fmt.Printf("  Total NetworkPolicies: %d\n", totalNetPols)
+		fmt.Printf("  Namespaces: %d\n", netpolStats.TotalNamespaces)
+	}
+
+	if imageErr == nil {
+		fmt.Printf("\n%sImages:%s\n", ColorYellow, ColorNC)
+		fmt.Printf("  Total Images: %d\n", imageCount)
+	}
+
+	if anpErr == nil {
+		fmt.Printf("\n%sAdmin Network Policies:%s\n", ColorYellow, ColorNC)
+		fmt.Printf("  AdminNetworkPolicies (ANP): %d\n", anpCount)
+		fmt.Printf("  BaselineAdminNetworkPolicies (BANP): %d\n", banpCount)
+	}
+
+	elapsedTime := time.Since(startTime)
+	fmt.Printf("\n%sList scenario completed in %.2f seconds%s\n", ColorGreen, elapsedTime.Seconds(), ColorNC)
+	fmt.Printf("%s%s%s\n\n", ColorCyan, strings.Repeat("=", 80), ColorNC)
+
+	return nil
 }
 
 // cleanupAllResources cleans up all created resources
@@ -1474,7 +1919,6 @@ func (e *EtcdStressTools) cleanupAllResources(ctx context.Context) {
 
 	e.logInfo("Starting cleanup of all created resources", "CLEANUP")
 
-	// Cleanup Images
 	if e.config.CreateImages {
 		imageGVR := schema.GroupVersionResource{
 			Group:    "image.openshift.io",
@@ -1499,7 +1943,6 @@ func (e *EtcdStressTools) cleanupAllResources(ctx context.Context) {
 		}
 	}
 
-	// List all namespaces with our label
 	namespaces, err := e.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{
 		LabelSelector: "stress-test=true",
 	})
@@ -1510,7 +1953,6 @@ func (e *EtcdStressTools) cleanupAllResources(ctx context.Context) {
 
 	e.logInfo(fmt.Sprintf("Found %d namespaces to clean up", len(namespaces.Items)), "CLEANUP")
 
-	// Delete namespaces in parallel
 	semaphore := make(chan struct{}, e.config.NamespaceParallel)
 	var wg sync.WaitGroup
 	var successful int
@@ -1539,9 +1981,7 @@ func (e *EtcdStressTools) cleanupAllResources(ctx context.Context) {
 	wg.Wait()
 	e.logInfo(fmt.Sprintf("Deleted %d/%d namespaces", successful, len(namespaces.Items)), "CLEANUP")
 
-	// Cleanup global network policies
 	if e.config.CreateANPBANP {
-		// Delete BANP
 		banpGVR := schema.GroupVersionResource{
 			Group:    "policy.networking.k8s.io",
 			Version:  "v1alpha1",
@@ -1549,7 +1989,6 @@ func (e *EtcdStressTools) cleanupAllResources(ctx context.Context) {
 		}
 		e.dynamicClient.Resource(banpGVR).Delete(ctx, "default", metav1.DeleteOptions{})
 
-		// Delete ANPs
 		anpGVR := schema.GroupVersionResource{
 			Group:    "policy.networking.k8s.io",
 			Version:  "v1alpha1",
@@ -1580,21 +2019,22 @@ func (e *EtcdStressTools) runComprehensiveTest(ctx context.Context) error {
 	startTime := time.Now()
 	e.logInfo("Starting comprehensive etcd stress test", "MAIN")
 
-	// Phase 1: Create global network policies first
 	e.createGlobalNetworkPolicies(ctx)
 
-	// Phase 2: Create Images
 	if err := e.createImages(ctx); err != nil {
 		e.logWarn(fmt.Sprintf("Failed to create images: %v", err), "MAIN")
 	}
 
-	// Phase 3: Create all namespaces and resources
 	e.createAllNamespacesAndResources(ctx)
 
 	elapsedTime := time.Since(startTime)
 	e.logInfo(fmt.Sprintf("Test completed successfully in %.2f seconds", elapsedTime.Seconds()), "MAIN")
 
-	// Phase 4: Cleanup (if enabled)
+	e.logInfo("Running list scenario to verify created resources", "MAIN")
+	if err := e.runListScenario(ctx); err != nil {
+		e.logWarn(fmt.Sprintf("List scenario failed: %v", err), "MAIN")
+	}
+
 	if e.config.CleanupOnCompletion {
 		e.logInfo("Starting cleanup phase", "MAIN")
 		e.cleanupAllResources(ctx)
@@ -1607,7 +2047,6 @@ func (e *EtcdStressTools) runComprehensiveTest(ctx context.Context) error {
 }
 
 func main() {
-	// Create argument parser
 	var (
 		totalNamespaces   = flag.Int("total-namespaces", 0, "Total number of namespaces to create")
 		namespaceParallel = flag.Int("namespace-parallel", 0, "Number of namespaces to process in parallel")
@@ -1624,54 +2063,18 @@ func main() {
 		retryDelay        = flag.Float64("retry-delay", 0, "Delay between retries in seconds")
 		cleanup           = flag.Bool("cleanup", false, "Enable cleanup after completion")
 		logLevel          = flag.String("log-level", "", "Set logging level")
+		listOnly          = flag.Bool("list-only", false, "Only list existing resources without creating")
 		help              = flag.Bool("help", false, "Show help message")
 	)
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Optimized OpenShift etcd Stress Testing Tool
 
-This tool creates comprehensive Kubernetes resources to stress test etcd:
-
-Resources Created Per Namespace:
-  - 10 Small ConfigMaps
-  - 3 Large ConfigMaps (1MB each, with 6GB total limit)
-  - 10 Small Secrets 
-  - 10 Large Secrets with certificates
-  - 2 Network Policies per namespace
-  - 1 EgressFirewall policy per namespace
-  - 5 Deployments (optional, with volume mounts)
-
-Global Resources:
-  - BaselineAdminNetworkPolicy (BANP)
-  - AdminNetworkPolicy (ANP) objects (total_namespaces/3)
-  - Images (total_namespaces * 5)
-
-Environment Variables:
-  TOTAL_NAMESPACES (default: 100)
-  NAMESPACE_PARALLEL (default: 10)
-  NAMESPACE_PREFIX (default: stress-test)
-  TOTAL_LARGE_CONFIGMAP_LIMIT_GB (default: 6)
-  CREATE_DEPLOYMENTS (default: true)
-  CREATE_EGRESS_FIREWALL (default: true)
-  CREATE_NETWORK_POLICIES (default: true)
-  CREATE_ANP_BANP (default: true)
-  CREATE_IMAGES (default: true)
-  MAX_CONCURRENT_OPERATIONS (default: 50)
-  NAMESPACE_READY_TIMEOUT (default: 60)
-  RESOURCE_RETRY_COUNT (default: 3)
-  RESOURCE_RETRY_DELAY (default: 1.0)
-  LOG_LEVEL
-  CLEANUP_ON_COMPLETION (default: false)
+This tool creates comprehensive Kubernetes resources to stress test etcd.
 
 Usage:
 `)
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, `
-Examples:
-  %s --total-namespaces 50 --namespace-parallel 5
-  %s --large-limit 8 --enable-deployments
-  %s --cleanup --no-images
-`, os.Args[0], os.Args[0], os.Args[0])
 	}
 
 	flag.Parse()
@@ -1681,10 +2084,8 @@ Examples:
 		return
 	}
 
-	// Create configuration
 	config := NewConfig()
 
-	// Override config with command line arguments
 	if *totalNamespaces != 0 {
 		config.TotalNamespaces = *totalNamespaces
 	}
@@ -1730,8 +2131,10 @@ Examples:
 	if *logLevel != "" {
 		config.LogLevel = *logLevel
 	}
+	if *listOnly {
+		config.ListOnly = true
+	}
 
-	// Create and run the stress test tool
 	tool, err := NewEtcdStressTools(config)
 	if err != nil {
 		log.Fatalf("Failed to create etcd stress tool: %v", err)
@@ -1740,18 +2143,24 @@ Examples:
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Handle interrupts
 	go func() {
 		c := make(chan os.Signal, 1)
-		// signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
 		tool.logWarn("Test interrupted by user", "MAIN")
 		cancel()
 		os.Exit(1)
 	}()
 
-	if err := tool.runComprehensiveTest(ctx); err != nil {
-		tool.logError(fmt.Sprintf("Test failed: %v", err), "MAIN")
-		os.Exit(1)
+	if config.ListOnly {
+		if err := tool.runListScenario(ctx); err != nil {
+			tool.logError(fmt.Sprintf("List scenario failed: %v", err), "MAIN")
+			os.Exit(1)
+		}
+	} else {
+		if err := tool.runComprehensiveTest(ctx); err != nil {
+			tool.logError(fmt.Sprintf("Test failed: %v", err), "MAIN")
+			os.Exit(1)
+		}
 	}
 }

@@ -64,7 +64,7 @@ class Config:
         
         # Deployment configuration (optional)
         self.create_deployments = os.getenv('CREATE_DEPLOYMENTS', 'true').lower() == 'true'
-        self.deployments_per_ns = 5
+        self.deployments_per_ns = 3
         
         # Network policy configuration
         self.create_egress_firewall = os.getenv('CREATE_EGRESS_FIREWALL', 'true').lower() == 'true'
@@ -579,7 +579,7 @@ class etcdStressTools:
 
     # 2.5 Create 5 deployments with mounted configmaps and secrets
     async def create_deployments(self, namespace: str) -> bool:
-        """Create 5 deployments with mounted ConfigMaps and Secrets"""
+        """Create 5 deployments with mounted ConfigMaps and Secrets, and wait for pods to be ready"""
         async def create_deployment(name: str) -> bool:
             try:
                 # Create volume mounts for ConfigMaps and Secrets
@@ -676,10 +676,18 @@ class etcdStressTools:
                     namespace=namespace,
                     body=deployment_body
                 )
-                return True
+                
+                # Wait for deployment pods to be ready
+                is_ready = await self.wait_for_deployment_ready(namespace, name)
+                if not is_ready:
+                    self.log_warn(f"Deployment {name} created but pods not ready in time", "DEPLOYMENT")
+                
+                return is_ready
+                
             except ApiException as e:
                 if e.status == 409:
-                    return True
+                    # Already exists, check if ready
+                    return await self.wait_for_deployment_ready(namespace, name)
                 self.log_warn(f"Failed to create Deployment {name} in {namespace}: {e}", "DEPLOYMENT")
                 return False
 
@@ -701,7 +709,66 @@ class etcdStressTools:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         success_count = sum(1 for result in results if result is True)
+        
+        self.log_info(f"Created {success_count}/{len(tasks)} deployments with ready pods in {namespace}", "DEPLOYMENT")
         return success_count == len(tasks)
+
+    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 300) -> bool:
+        """Wait for deployment pods to be ready"""
+        deadline = time.time() + timeout
+        
+        while time.time() < deadline:
+            try:
+                # Get deployment status
+                deployment = await asyncio.to_thread(
+                    self.apps_v1.read_namespaced_deployment,
+                    name=deployment_name,
+                    namespace=namespace
+                )
+                
+                # Check if deployment has desired replicas
+                spec_replicas = deployment.spec.replicas or 0
+                status = deployment.status
+                
+                ready_replicas = status.ready_replicas or 0
+                available_replicas = status.available_replicas or 0
+                
+                # Check if all replicas are ready and available
+                if (ready_replicas == spec_replicas and 
+                    available_replicas == spec_replicas and 
+                    spec_replicas > 0):
+                    
+                    # Double-check pods are actually running
+                    pods = await asyncio.to_thread(
+                        self.core_v1.list_namespaced_pod,
+                        namespace=namespace,
+                        label_selector=f"app={deployment_name}"
+                    )
+                    
+                    running_pods = [
+                        pod for pod in pods.items
+                        if pod.status.phase == "Running" and
+                        all(c.ready for c in (pod.status.container_statuses or []))
+                    ]
+                    
+                    if len(running_pods) == spec_replicas:
+                        self.log_info(f"Deployment {deployment_name} is ready with {spec_replicas} pods running", "DEPLOYMENT")
+                        return True
+                
+                await asyncio.sleep(2)
+                
+            except ApiException as e:
+                if e.status == 404:
+                    await asyncio.sleep(2)
+                    continue
+                self.log_warn(f"Error checking deployment {deployment_name} status: {e}", "DEPLOYMENT")
+                return False
+            except Exception as e:
+                self.log_warn(f"Unexpected error checking deployment {deployment_name}: {e}", "DEPLOYMENT")
+                return False
+        
+        self.log_warn(f"Timeout waiting for deployment {deployment_name} to be ready", "DEPLOYMENT")
+        return False
 
     # 2.6 Create EgressFirewall policy
     async def create_egress_firewall(self, namespace: str) -> bool:
@@ -1487,6 +1554,401 @@ class etcdStressTools:
         except Exception as e:
             self.log_error(f"Cleanup failed: {e}", "CLEANUP")
 
+    async def list_all_pods(self) -> Dict[str, Any]:
+        """List all pods across all stress-test namespaces"""
+        try:
+            self.log_info("Listing all pods in stress-test namespaces", "LIST-PODS")
+            
+            # Get all namespaces with stress-test label
+            namespaces = await asyncio.to_thread(self.core_v1.list_namespace)
+            stress_namespaces = [
+                ns.metadata.name for ns in namespaces.items
+                if ns.metadata.labels and ns.metadata.labels.get('stress-test') == 'true'
+            ]
+            
+            total_pods = 0
+            pod_details = {}
+            
+            for ns in stress_namespaces:
+                try:
+                    pods = await asyncio.to_thread(
+                        self.core_v1.list_namespaced_pod,
+                        namespace=ns
+                    )
+                    pod_count = len(pods.items)
+                    total_pods += pod_count
+                    
+                    pod_details[ns] = {
+                        'count': pod_count,
+                        'pods': [
+                            {
+                                'name': pod.metadata.name,
+                                'phase': pod.status.phase,
+                                'ready': sum(1 for c in (pod.status.container_statuses or []) if c.ready)
+                            }
+                            for pod in pods.items
+                        ]
+                    }
+                except ApiException as e:
+                    self.log_warn(f"Failed to list pods in {ns}: {e}", "LIST-PODS")
+            
+            self.log_info(f"Total pods found: {total_pods} across {len(stress_namespaces)} namespaces", "LIST-PODS")
+            return {
+                'total_pods': total_pods,
+                'total_namespaces': len(stress_namespaces),
+                'details': pod_details
+            }
+            
+        except Exception as e:
+            self.log_error(f"Failed to list pods: {e}", "LIST-PODS")
+            return {'error': str(e)}
+
+    async def list_all_configmaps(self) -> Dict[str, Any]:
+        """List all configmaps across all stress-test namespaces"""
+        try:
+            self.log_info("Listing all ConfigMaps in stress-test namespaces", "LIST-CM")
+            
+            namespaces = await asyncio.to_thread(self.core_v1.list_namespace)
+            stress_namespaces = [
+                ns.metadata.name for ns in namespaces.items
+                if ns.metadata.labels and ns.metadata.labels.get('stress-test') == 'true'
+            ]
+            
+            total_configmaps = 0
+            total_small = 0
+            total_large = 0
+            cm_details = {}
+            
+            for ns in stress_namespaces:
+                try:
+                    configmaps = await asyncio.to_thread(
+                        self.core_v1.list_namespaced_config_map,
+                        namespace=ns
+                    )
+                    
+                    small_cms = [cm for cm in configmaps.items 
+                            if cm.metadata.labels and cm.metadata.labels.get('type') == 'small-configmap']
+                    large_cms = [cm for cm in configmaps.items 
+                            if cm.metadata.labels and cm.metadata.labels.get('type') == 'large-configmap']
+                    
+                    ns_small = len(small_cms)
+                    ns_large = len(large_cms)
+                    
+                    total_configmaps += len(configmaps.items)
+                    total_small += ns_small
+                    total_large += ns_large
+                    
+                    cm_details[ns] = {
+                        'total': len(configmaps.items),
+                        'small': ns_small,
+                        'large': ns_large
+                    }
+                except ApiException as e:
+                    self.log_warn(f"Failed to list ConfigMaps in {ns}: {e}", "LIST-CM")
+            
+            self.log_info(f"Total ConfigMaps: {total_configmaps} (Small: {total_small}, Large: {total_large})", "LIST-CM")
+            return {
+                'total_configmaps': total_configmaps,
+                'total_small': total_small,
+                'total_large': total_large,
+                'total_namespaces': len(stress_namespaces),
+                'details': cm_details
+            }
+            
+        except Exception as e:
+            self.log_error(f"Failed to list ConfigMaps: {e}", "LIST-CM")
+            return {'error': str(e)}
+
+    async def list_all_secrets(self) -> Dict[str, Any]:
+        """List all secrets across all stress-test namespaces"""
+        try:
+            self.log_info("Listing all Secrets in stress-test namespaces", "LIST-SECRET")
+            
+            namespaces = await asyncio.to_thread(self.core_v1.list_namespace)
+            stress_namespaces = [
+                ns.metadata.name for ns in namespaces.items
+                if ns.metadata.labels and ns.metadata.labels.get('stress-test') == 'true'
+            ]
+            
+            total_secrets = 0
+            total_small = 0
+            total_large = 0
+            secret_details = {}
+            
+            for ns in stress_namespaces:
+                try:
+                    secrets = await asyncio.to_thread(
+                        self.core_v1.list_namespaced_secret,
+                        namespace=ns
+                    )
+                    
+                    small_secrets = [s for s in secrets.items 
+                                if s.metadata.labels and s.metadata.labels.get('type') == 'small-secret']
+                    large_secrets = [s for s in secrets.items 
+                                if s.metadata.labels and s.metadata.labels.get('type') == 'large-secret']
+                    
+                    ns_small = len(small_secrets)
+                    ns_large = len(large_secrets)
+                    
+                    total_secrets += len(secrets.items)
+                    total_small += ns_small
+                    total_large += ns_large
+                    
+                    secret_details[ns] = {
+                        'total': len(secrets.items),
+                        'small': ns_small,
+                        'large': ns_large
+                    }
+                except ApiException as e:
+                    self.log_warn(f"Failed to list Secrets in {ns}: {e}", "LIST-SECRET")
+            
+            self.log_info(f"Total Secrets: {total_secrets} (Small: {total_small}, Large: {total_large})", "LIST-SECRET")
+            return {
+                'total_secrets': total_secrets,
+                'total_small': total_small,
+                'total_large': total_large,
+                'total_namespaces': len(stress_namespaces),
+                'details': secret_details
+            }
+            
+        except Exception as e:
+            self.log_error(f"Failed to list Secrets: {e}", "LIST-SECRET")
+            return {'error': str(e)}
+
+    async def list_all_network_policies(self) -> Dict[str, Any]:
+        """List all NetworkPolicies across all stress-test namespaces"""
+        try:
+            self.log_info("Listing all NetworkPolicies in stress-test namespaces", "LIST-NETPOL")
+            
+            namespaces = await asyncio.to_thread(self.core_v1.list_namespace)
+            stress_namespaces = [
+                ns.metadata.name for ns in namespaces.items
+                if ns.metadata.labels and ns.metadata.labels.get('stress-test') == 'true'
+            ]
+            
+            total_netpols = 0
+            netpol_details = {}
+            
+            for ns in stress_namespaces:
+                try:
+                    netpols = await asyncio.to_thread(
+                        self.networking_v1.list_namespaced_network_policy,
+                        namespace=ns
+                    )
+                    
+                    stress_netpols = [np for np in netpols.items 
+                                     if np.metadata.labels and np.metadata.labels.get('stress-test') == 'true']
+                    
+                    ns_count = len(stress_netpols)
+                    total_netpols += ns_count
+                    
+                    netpol_details[ns] = {
+                        'count': ns_count,
+                        'policies': [
+                            {
+                                'name': np.metadata.name,
+                                'ingress_rules': len(np.spec.ingress or []),
+                                'egress_rules': len(np.spec.egress or [])
+                            }
+                            for np in stress_netpols
+                        ]
+                    }
+                except ApiException as e:
+                    self.log_warn(f"Failed to list NetworkPolicies in {ns}: {e}", "LIST-NETPOL")
+            
+            self.log_info(f"Total NetworkPolicies: {total_netpols} across {len(stress_namespaces)} namespaces", "LIST-NETPOL")
+            return {
+                'total_network_policies': total_netpols,
+                'total_namespaces': len(stress_namespaces),
+                'details': netpol_details
+            }
+            
+        except Exception as e:
+            self.log_error(f"Failed to list NetworkPolicies: {e}", "LIST-NETPOL")
+            return {'error': str(e)}
+
+    async def list_all_images(self) -> Dict[str, Any]:
+        """List all Images created by stress test"""
+        try:
+            self.log_info("Listing all Images created by stress test", "LIST-IMAGE")
+            
+            images = await asyncio.to_thread(
+                self.custom_objects.list_cluster_custom_object,
+                group="image.openshift.io",
+                version="v1",
+                plural="images"
+            )
+            
+            stress_images = [
+                img for img in images.get('items', [])
+                if img.get('metadata', {}).get('labels', {}).get('stress-test') == 'true'
+            ]
+            
+            image_details = [
+                {
+                    'name': img.get('metadata', {}).get('name'),
+                    'docker_image_reference': img.get('dockerImageReference', 'N/A'),
+                    'created': img.get('metadata', {}).get('creationTimestamp', 'N/A')
+                }
+                for img in stress_images
+            ]
+            
+            self.log_info(f"Total Images: {len(stress_images)}", "LIST-IMAGE")
+            return {
+                'total_images': len(stress_images),
+                'images': image_details
+            }
+            
+        except Exception as e:
+            self.log_error(f"Failed to list Images: {e}", "LIST-IMAGE")
+            return {'error': str(e)}
+
+    async def list_all_admin_network_policies(self) -> Dict[str, Any]:
+        """List all AdminNetworkPolicies and BaselineAdminNetworkPolicy"""
+        try:
+            self.log_info("Listing AdminNetworkPolicies and BaselineAdminNetworkPolicy", "LIST-ANP")
+            
+            result = {
+                'banp': None,
+                'anps': [],
+                'total_anps': 0
+            }
+            
+            # List BaselineAdminNetworkPolicy
+            try:
+                banps = await asyncio.to_thread(
+                    self.custom_objects.list_cluster_custom_object,
+                    group="policy.networking.k8s.io",
+                    version="v1alpha1",
+                    plural="baselineadminnetworkpolicies"
+                )
+                
+                stress_banps = [
+                    banp for banp in banps.get('items', [])
+                    if banp.get('metadata', {}).get('labels', {}).get('stress-test') == 'true'
+                ]
+                
+                if stress_banps:
+                    banp = stress_banps[0]
+                    result['banp'] = {
+                        'name': banp.get('metadata', {}).get('name'),
+                        'ingress_rules': len(banp.get('spec', {}).get('ingress', [])),
+                        'egress_rules': len(banp.get('spec', {}).get('egress', [])),
+                        'created': banp.get('metadata', {}).get('creationTimestamp', 'N/A')
+                    }
+            except ApiException as e:
+                self.log_warn(f"Failed to list BaselineAdminNetworkPolicy: {e}", "LIST-ANP")
+            
+            # List AdminNetworkPolicies
+            try:
+                anps = await asyncio.to_thread(
+                    self.custom_objects.list_cluster_custom_object,
+                    group="policy.networking.k8s.io",
+                    version="v1alpha1",
+                    plural="adminnetworkpolicies"
+                )
+                
+                stress_anps = [
+                    anp for anp in anps.get('items', [])
+                    if anp.get('metadata', {}).get('labels', {}).get('stress-test') == 'true'
+                ]
+                
+                result['total_anps'] = len(stress_anps)
+                result['anps'] = [
+                    {
+                        'name': anp.get('metadata', {}).get('name'),
+                        'priority': anp.get('spec', {}).get('priority'),
+                        'ingress_rules': len(anp.get('spec', {}).get('ingress', [])),
+                        'egress_rules': len(anp.get('spec', {}).get('egress', [])),
+                        'created': anp.get('metadata', {}).get('creationTimestamp', 'N/A')
+                    }
+                    for anp in stress_anps
+                ]
+            except ApiException as e:
+                self.log_warn(f"Failed to list AdminNetworkPolicies: {e}", "LIST-ANP")
+            
+            self.log_info(f"Total AdminNetworkPolicies: {result['total_anps']}, BANP: {'Found' if result['banp'] else 'Not Found'}", "LIST-ANP")
+            return result
+            
+        except Exception as e:
+            self.log_error(f"Failed to list Admin Network Policies: {e}", "LIST-ANP")
+            return {'error': str(e)}
+
+    async def run_list_scenario(self):
+        """Run listing scenario for all resource types"""
+        try:
+            self.log_info("Starting list scenario for large-scale resources", "LIST")
+            start_time = time.time()
+            
+            # Run all listing operations concurrently
+            results = await asyncio.gather(
+                self.list_all_pods(),
+                self.list_all_configmaps(),
+                self.list_all_secrets(),
+                self.list_all_network_policies(),
+                self.list_all_images(),
+                self.list_all_admin_network_policies(),
+                return_exceptions=True
+            )
+            
+            pods_result, cms_result, secrets_result, netpols_result, images_result, anp_result = results
+            
+            # Print summary
+            print(f"\n{Colors.CYAN}{'='*80}{Colors.NC}")
+            print(f"{Colors.GREEN}Resource Listing Summary{Colors.NC}")
+            print(f"{Colors.CYAN}{'='*80}{Colors.NC}")
+            
+            if isinstance(pods_result, dict) and 'total_pods' in pods_result:
+                print(f"\n{Colors.YELLOW}Pods:{Colors.NC}")
+                print(f"  Total Pods: {pods_result['total_pods']}")
+                print(f"  Namespaces: {pods_result['total_namespaces']}")
+            
+            if isinstance(cms_result, dict) and 'total_configmaps' in cms_result:
+                print(f"\n{Colors.YELLOW}ConfigMaps:{Colors.NC}")
+                print(f"  Total ConfigMaps: {cms_result['total_configmaps']}")
+                print(f"  Small ConfigMaps: {cms_result['total_small']}")
+                print(f"  Large ConfigMaps: {cms_result['total_large']}")
+                print(f"  Namespaces: {cms_result['total_namespaces']}")
+            
+            if isinstance(secrets_result, dict) and 'total_secrets' in secrets_result:
+                print(f"\n{Colors.YELLOW}Secrets:{Colors.NC}")
+                print(f"  Total Secrets: {secrets_result['total_secrets']}")
+                print(f"  Small Secrets: {secrets_result['total_small']}")
+                print(f"  Large Secrets: {secrets_result['total_large']}")
+                print(f"  Namespaces: {secrets_result['total_namespaces']}")
+            
+            if isinstance(netpols_result, dict) and 'total_network_policies' in netpols_result:
+                print(f"\n{Colors.YELLOW}NetworkPolicies:{Colors.NC}")
+                print(f"  Total NetworkPolicies: {netpols_result['total_network_policies']}")
+                print(f"  Namespaces: {netpols_result['total_namespaces']}")
+            
+            if isinstance(images_result, dict) and 'total_images' in images_result:
+                print(f"\n{Colors.YELLOW}Images:{Colors.NC}")
+                print(f"  Total Images: {images_result['total_images']}")
+            
+            if isinstance(anp_result, dict) and 'total_anps' in anp_result:
+                print(f"\n{Colors.YELLOW}Admin Network Policies:{Colors.NC}")
+                print(f"  Total AdminNetworkPolicies: {anp_result['total_anps']}")
+                print(f"  BaselineAdminNetworkPolicy: {'Found' if anp_result.get('banp') else 'Not Found'}")
+            
+            elapsed_time = time.time() - start_time
+            print(f"\n{Colors.GREEN}List scenario completed in {elapsed_time:.2f} seconds{Colors.NC}")
+            print(f"{Colors.CYAN}{'='*80}{Colors.NC}\n")
+            
+            return {
+                'pods': pods_result,
+                'configmaps': cms_result,
+                'secrets': secrets_result,
+                'network_policies': netpols_result,
+                'images': images_result,
+                'admin_network_policies': anp_result,
+                'elapsed_time': elapsed_time
+            }
+            
+        except Exception as e:
+            self.log_error(f"List scenario failed: {e}", "LIST")
+            raise
+
     async def run_comprehensive_test(self):
         """Run the complete stress test"""
         try:
@@ -1505,7 +1967,11 @@ class etcdStressTools:
             elapsed_time = time.time() - start_time
             self.log_info(f"Test completed successfully in {elapsed_time:.2f} seconds", "MAIN")
             
-            # Phase 4: Cleanup (if enabled)
+            # Phase 4: Run list scenario to verify created resources
+            self.log_info("Running list scenario to verify created resources", "MAIN")
+            await self.run_list_scenario()
+            
+            # Phase 5: Cleanup (if enabled)
             if self.config.cleanup_on_completion:
                 self.log_info("Starting cleanup phase", "MAIN")
                 await self.cleanup_all_resources()
@@ -1519,7 +1985,6 @@ class etcdStressTools:
         except Exception as e:
             self.log_error(f"Test failed: {e}", "MAIN")
             raise
-
 
 def create_argument_parser():
     """Create and configure argument parser"""
@@ -1606,9 +2071,9 @@ Examples:
                        help='Set logging level')
     parser.add_argument('--log-file',
                        help='Log file path')
-    
+    parser.add_argument('--list-only', action='store_true',
+                       help='Only list existing resources without creating')    
     return parser
-
 
 async def main():
     """Main execution function"""
@@ -1656,14 +2121,19 @@ async def main():
     tool = etcdStressTools(config)
     
     try:
-        await tool.run_comprehensive_test()
+        # Check if list-only mode
+        if args.list_only:
+            # Only run list scenario
+            await tool.run_list_scenario()
+        else:
+            # Run comprehensive test (which now includes listing)
+            await tool.run_comprehensive_test()
     except KeyboardInterrupt:
         tool.log_warn("Test interrupted by user", "MAIN")
         sys.exit(1)
     except Exception as e:
         tool.log_error(f"Test failed: {e}", "MAIN")
         sys.exit(1)
-
 
 if __name__ == '__main__':
     asyncio.run(main())

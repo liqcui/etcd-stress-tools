@@ -1,12 +1,13 @@
 # OpenShift etcd Stress Testing Tool
 
-A high-performance, async Python tool for comprehensive Kubernetes resource creation to stress test etcd performance in OpenShift clusters.
+A high-performance, async Python tool for comprehensive Kubernetes resource creation and listing to stress test etcd performance in OpenShift clusters.
 
 ## Features
 
 - **Modular Design**: Separate functions for each resource type
 - **Maximum Concurrency**: Optimized async operations with configurable limits
 - **Comprehensive Resource Creation**: ConfigMaps, Secrets, Deployments, Network Policies, and more
+- **Resource Listing**: List and verify all created resources across the cluster
 - **Flexible Configuration**: Environment variables and command-line options
 - **Optional Cleanup**: Automated resource cleanup after testing
 - **Progress Monitoring**: Real-time progress reporting with colored output
@@ -15,7 +16,7 @@ A high-performance, async Python tool for comprehensive Kubernetes resource crea
 
 ### Per Namespace (100 namespaces by default)
 - **10 Small ConfigMaps** (5 key-value pairs each)
-- **1 Large ConfigMap** (1MB size, respects 6GB total limit)
+- **3 Large ConfigMaps** (1MB each, respects 6GB total limit)
 - **10 Small Secrets** (username, password, token)
 - **10 Large Secrets** (TLS certificates, SSH keys, large tokens)
 - **1 EgressFirewall** (10 rules with Allow/Deny policies)
@@ -59,6 +60,9 @@ python3 etcd-stress-tools.py --enable-deployments --cleanup
 
 # Disable certain features
 python3 etcd-stress-tools.py --no-images --no-anp-banp
+
+# List existing resources only (no creation)
+python3 etcd-stress-tools.py --list-only
 ```
 
 ### Command Line Options
@@ -75,7 +79,11 @@ python3 etcd-stress-tools.py --no-images --no-anp-banp
 | `--no-anp-banp` | Disable ANP/BANP creation | false |
 | `--no-images` | Disable Image creation | false |
 | `--max-concurrent` | Max concurrent operations | 50 |
+| `--namespace-timeout` | Namespace readiness timeout (seconds) | 60 |
+| `--retry-count` | Number of retries for failed operations | 3 |
+| `--retry-delay` | Delay between retries (seconds) | 1.0 |
 | `--cleanup` | Enable cleanup after completion | false |
+| `--list-only` | Only list resources without creating | false |
 | `--log-level` | Logging level (DEBUG/INFO/WARNING/ERROR) | INFO |
 | `--log-file` | Log file path | etcd_stress_test.log |
 
@@ -92,6 +100,9 @@ export CREATE_NETWORK_POLICIES=true
 export CREATE_ANP_BANP=true
 export CREATE_IMAGES=true
 export MAX_CONCURRENT_OPERATIONS=100
+export NAMESPACE_READY_TIMEOUT=60
+export RESOURCE_RETRY_COUNT=3
+export RESOURCE_RETRY_DELAY=1.0
 export LOG_LEVEL=DEBUG
 export CLEANUP_ON_COMPLETION=true
 ```
@@ -100,16 +111,25 @@ export CLEANUP_ON_COMPLETION=true
 
 ### Modular Functions
 
+#### Resource Creation Functions
 1. **create_small_configmaps()** - Creates 10 small ConfigMaps per namespace in parallel
-2. **create_large_configmap()** - Creates 1 large (1MB) ConfigMap with size limits
+2. **create_large_configmap()** - Creates 3 large (1MB) ConfigMaps with size limits
 3. **create_small_secrets()** - Creates 10 small Secrets in parallel
 4. **create_large_secrets()** - Creates 10 large Secrets with certificates
-5. **create_deployments()** - Creates 5 deployments with volume mounts (optional)
+5. **create_deployments()** - Creates 3 deployments with volume mounts (optional)
 6. **create_egress_firewall()** - Creates EgressFirewall with 10 rules
 7. **create_network_policies()** - Creates 2 NetworkPolicies per namespace
 8. **create_baseline_admin_network_policy()** - Creates cluster-wide BANP
 9. **create_admin_network_policies()** - Creates ANPs with fake IPs
 10. **create_images()** - Creates OpenShift Image resources
+
+#### Resource Listing Functions
+1. **list_all_pods()** - Lists all pods across stress-test namespaces
+2. **list_all_configmaps()** - Lists and categorizes ConfigMaps (small/large)
+3. **list_all_secrets()** - Lists and categorizes Secrets (small/large)
+4. **list_all_network_policies()** - Lists NetworkPolicies with rule counts
+5. **list_all_images()** - Lists cluster-wide Image resources
+6. **list_all_admin_network_policies()** - Lists ANPs and BANP with priorities
 
 ### Concurrency Design
 
@@ -124,7 +144,62 @@ export CLEANUP_ON_COMPLETION=true
 - ThreadPoolExecutor for CPU-intensive certificate generation
 - Semaphores for concurrency control
 - Batch processing with progress reporting
-- Exception handling with retry logic
+- Exception handling with exponential backoff retry logic
+- Namespace readiness verification before resource creation
+
+## Resource Listing
+
+### List Scenario Output
+
+The tool automatically runs a comprehensive listing scenario after resource creation, or you can run it independently with `--list-only`:
+
+```
+================================================================================
+Resource Listing Summary
+================================================================================
+
+Pods:
+  Total Pods: 500
+  Namespaces: 100
+
+ConfigMaps:
+  Total ConfigMaps: 1300
+  Small ConfigMaps: 1000
+  Large ConfigMaps: 300
+  Namespaces: 100
+
+Secrets:
+  Total Secrets: 2000
+  Small Secrets: 1000
+  Large Secrets: 1000
+  Namespaces: 100
+
+NetworkPolicies:
+  Total NetworkPolicies: 200
+  Namespaces: 100
+
+Images:
+  Total Images: 500
+
+Admin Network Policies:
+  Total AdminNetworkPolicies: 33
+  BaselineAdminNetworkPolicy: Found
+
+List scenario completed in 12.45 seconds
+================================================================================
+```
+
+### List Only Mode
+
+Use `--list-only` to verify existing resources without creating new ones:
+
+```bash
+# List all stress-test resources
+python3 etcd-stress-tools.py --list-only
+
+# List with custom namespace prefix
+python3 etcd-stress-tools.py --list-only --namespace-prefix my-stress
+```
 
 ## Resource Specifications
 
@@ -148,7 +223,7 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: large-cm-1
+  name: large-cm-{1-3}
   labels:
     type: large-configmap
     stress-test: "true"
@@ -242,13 +317,43 @@ spec:
 - Success/error counters per batch
 - Total execution time tracking
 - Colored console output for easy reading
+- Detailed resource listing summaries
 
 ### Log Format
 ```
 [COMPONENT] 2024-01-01 12:00:00 - Message
 ```
 
-Components: MAIN, NAMESPACE, CONFIGMAP, SECRET, DEPLOYMENT, NETPOL, ANP, BANP, IMAGE, CLEANUP
+Components: MAIN, NAMESPACE, CONFIGMAP, SECRET, DEPLOYMENT, NETPOL, EGRESSFW, ANP, BANP, IMAGE, CLEANUP, LIST-PODS, LIST-CM, LIST-SECRET, LIST-NETPOL, LIST-IMAGE, LIST-ANP
+
+## Test Workflow
+
+The tool follows this execution flow:
+
+1. **Phase 1: Global Network Policies**
+   - Create BaselineAdminNetworkPolicy (BANP)
+   - Create AdminNetworkPolicies (ANPs)
+
+2. **Phase 2: Images**
+   - Create cluster-wide Image resources
+
+3. **Phase 3: Namespace Creation**
+   - Create all namespaces with labels
+   - Wait for namespace readiness with verification
+
+4. **Phase 4: Resource Creation**
+   - Create ConfigMaps and Secrets (in parallel)
+   - Create NetworkPolicies and EgressFirewalls
+   - Create Deployments (if enabled)
+
+5. **Phase 5: Verification**
+   - List all created resources
+   - Display comprehensive summary
+
+6. **Phase 6: Cleanup (Optional)**
+   - Delete all Images
+   - Delete all stress-test namespaces
+   - Delete ANPs and BANP
 
 ## Cleanup
 
@@ -295,10 +400,16 @@ kubectl delete images -l stress-test=true
    - AdminNetworkPolicy and BaselineAdminNetworkPolicy require OVN-Kubernetes
    - Use `--no-anp-banp` to disable if not available
 
+5. **Namespace Not Ready Errors**
+   - Tool waits up to 60 seconds for namespace readiness
+   - Adjust `--namespace-timeout` if needed
+   - Check for namespace admission webhooks
+
 ### Performance Tuning
 
 - Adjust `--max-concurrent` based on cluster capacity
 - Reduce `--namespace-parallel` if experiencing API throttling
+- Increase `--retry-count` for unstable clusters
 - Monitor etcd metrics during execution
 - Consider running during maintenance windows for large-scale tests
 
@@ -333,6 +444,28 @@ python3 etcd-stress-tools.py \
   --cleanup
 ```
 
+### List Existing Resources
+```bash
+# List all resources without creating
+python3 etcd-stress-tools.py --list-only
+
+# List with custom prefix
+python3 etcd-stress-tools.py --list-only --namespace-prefix my-test
+```
+
+### Quick Verification Test
+```bash
+# Create small test and verify
+python3 etcd-stress-tools.py \
+  --total-namespaces 5 \
+  --namespace-parallel 2 \
+  --no-images \
+  --no-anp-banp \
+  --cleanup
+```
+## Demo
+[![asciicast](https://asciinema.org/a/745466.svg)](https://asciinema.org/a/745466)
+
 ## Requirements
 
 ### Minimum Requirements
@@ -352,9 +485,6 @@ python3 etcd-stress-tools.py \
 - 8GB+ RAM for large-scale tests
 - Fast network connection to cluster
 - SSD storage for etcd cluster
-
-### Demo
-[![asciicast](https://asciinema.org/a/745466.svg)](https://asciinema.org/a/745466)
 
 ## License
 
