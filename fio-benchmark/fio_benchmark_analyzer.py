@@ -2,7 +2,7 @@
 """
 FIO Benchmark Analyzer for OpenShift Master Nodes
 Automatically discovers master nodes and runs FIO benchmarks with LLM analysis
-Updated with DuckDB storage integration
+Updated with DuckDB storage integration and node hardware info
 """
 
 import json
@@ -24,6 +24,15 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
+
+
+@dataclass
+class NodeHardwareInfo:
+    """Data class to store node hardware information"""
+    instance_type: str = "Unknown"
+    cpu_cores: int = 0
+    memory_gb: float = 0.0
+    architecture: str = "Unknown"
 
 
 @dataclass
@@ -69,6 +78,9 @@ class fioBenchmarkAnalyzer:
         
         # Initialize database if enabled
         self.db = fioBenchmarkDB(db_path) if enable_db else None
+        
+        # Cache for node hardware info
+        self._node_hardware_cache: Dict[str, NodeHardwareInfo] = {}
         
         # FIO test configurations
         self.fio_tests = {
@@ -133,22 +145,13 @@ class fioBenchmarkAnalyzer:
         return logging.getLogger(__name__)
 
     def _sanitize_llm_text(self, text: str) -> str:
-        """Clean up LLM output: unescape literal newlines/tabs, trim spaces, and collapse blank lines.
-
-        This makes the analysis easier to read in console and JSON reports by:
-        - Converting literal "\\n"/"\\t" to actual newlines/tabs
-        - Normalizing CRLF to LF
-        - Stripping leading/trailing whitespace per line
-        - Collapsing consecutive empty lines to at most one
-        """
+        """Clean up LLM output: unescape literal newlines/tabs, trim spaces, and collapse blank lines."""
         if not text:
             return ""
 
-        # Normalize newlines and unescape common sequences
         cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
         cleaned = cleaned.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "")
 
-        # Trim each line and collapse multiple blank lines
         lines = [line.strip() for line in cleaned.split("\n")]
         normalized_lines = []
         previous_blank = False
@@ -159,13 +162,72 @@ class fioBenchmarkAnalyzer:
             normalized_lines.append(line)
             previous_blank = is_blank
 
-        # Remove leading/trailing blank lines
         while normalized_lines and normalized_lines[0] == "":
             normalized_lines.pop(0)
         while normalized_lines and normalized_lines[-1] == "":
             normalized_lines.pop()
 
         return "\n".join(normalized_lines)
+
+    def get_node_hardware_info(self, node_name: str) -> NodeHardwareInfo:
+        """Get hardware information for a specific node"""
+        # Check cache first
+        if node_name in self._node_hardware_cache:
+            return self._node_hardware_cache[node_name]
+        
+        hardware_info = NodeHardwareInfo()
+        
+        try:
+            # Get node information as JSON
+            cmd = ["oc", "get", "node", node_name, "-o", "json"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                node_data = json.loads(result.stdout)
+                
+                # Extract instance type from labels
+                labels = node_data.get("metadata", {}).get("labels", {})
+                hardware_info.instance_type = (
+                    labels.get("node.kubernetes.io/instance-type") or
+                    labels.get("beta.kubernetes.io/instance-type") or
+                    labels.get("node-role.kubernetes.io/worker") and "Worker" or
+                    "Unknown"
+                )
+                
+                # Extract CPU cores
+                capacity = node_data.get("status", {}).get("capacity", {})
+                cpu_str = capacity.get("cpu", "0")
+                try:
+                    hardware_info.cpu_cores = int(cpu_str)
+                except ValueError:
+                    hardware_info.cpu_cores = 0
+                
+                # Extract memory (convert from Ki to GB)
+                memory_str = capacity.get("memory", "0Ki")
+                memory_ki = re.sub(r'[^\d]', '', memory_str)
+                try:
+                    memory_bytes = int(memory_ki) * 1024
+                    hardware_info.memory_gb = round(memory_bytes / (1024**3), 2)
+                except ValueError:
+                    hardware_info.memory_gb = 0.0
+                
+                # Extract architecture
+                node_info = node_data.get("status", {}).get("nodeInfo", {})
+                hardware_info.architecture = node_info.get("architecture", "Unknown")
+                
+                self.logger.info(
+                    f"Node {node_name}: {hardware_info.instance_type}, "
+                    f"{hardware_info.cpu_cores} cores, {hardware_info.memory_gb} GB RAM"
+                )
+            else:
+                self.logger.warning(f"Failed to get hardware info for node {node_name}")
+                
+        except Exception as e:
+            self.logger.error(f"Error getting hardware info for {node_name}: {e}")
+        
+        # Cache the result
+        self._node_hardware_cache[node_name] = hardware_info
+        return hardware_info
 
     def get_master_nodes(self) -> List[str]:
         """Get list of master nodes using OpenShift JSON path"""
@@ -219,7 +281,7 @@ class fioBenchmarkAnalyzer:
                 debug_cmd,
                 capture_output=True,
                 text=True,
-                timeout=600  # 10 minute timeout
+                timeout=600
             )
             
             result.raw_output = process.stdout
@@ -227,7 +289,6 @@ class fioBenchmarkAnalyzer:
             if process.returncode != 0:
                 result.error = process.stderr
                 self.logger.error(f"FIO test failed on {node_name}: {process.stderr}")
-                # Attempt cleanup even if test failed
                 self._cleanup_test_files_on_node(node_name, test_name)
                 return result
                 
@@ -238,7 +299,6 @@ class fioBenchmarkAnalyzer:
         except subprocess.TimeoutExpired:
             result.error = "Test timeout (600s)"
             self.logger.error(f"FIO test timeout on {node_name}")
-            # Cleanup after timeout
             self._cleanup_test_files_on_node(node_name, test_name)
         except Exception as e:
             result.error = str(e)
@@ -502,7 +562,7 @@ class fioBenchmarkAnalyzer:
                     print(chunk.content, end='', flush=True)
                     full_response += chunk.content
             
-            print("\n")  # Add newline after streaming completes
+            print("\n")
             
             state["analysis"] = full_response
             state["messages"].append(HumanMessage(content=full_response))
@@ -546,6 +606,12 @@ class fioBenchmarkAnalyzer:
         db_uuids = []
         cluster_name = None
         infrastructure_type = None
+        node_hardware_info = None
+        
+        # Get hardware info for the tested node
+        if results:
+            test_node = results[0].node_name
+            node_hardware_info = self.get_node_hardware_info(test_node)
         
         if save_to_db and self.enable_db and self.db:
             try:
@@ -567,7 +633,6 @@ class fioBenchmarkAnalyzer:
         llm_analysis = ""
         if self.enable_llm:
             llm_analysis = self.analyze_with_llm(results)
-            # Analysis is already sanitized and streamed to console
         
         validation_report = self.utils.validate_against_baselines(
             [asdict(r) for r in results]
@@ -578,6 +643,12 @@ class fioBenchmarkAnalyzer:
             "run_uuid": run_uuid,
             "cluster_name": cluster_name,
             "infrastructure_type": infrastructure_type,
+            "node_hardware": {
+                "instance_type": node_hardware_info.instance_type if node_hardware_info else "Unknown",
+                "cpu_cores": node_hardware_info.cpu_cores if node_hardware_info else 0,
+                "memory_gb": node_hardware_info.memory_gb if node_hardware_info else 0.0,
+                "architecture": node_hardware_info.architecture if node_hardware_info else "Unknown"
+            } if node_hardware_info else None,
             "target_node": target_node,
             "specific_test": specific_test,
             "results": [asdict(r) for r in results],
@@ -597,7 +668,8 @@ class fioBenchmarkAnalyzer:
             html_filename = f"fio_benchmark_report_{timestamp_str}.html"
             self.utils.generate_test_report_html(
                 [asdict(r) for r in results], 
-                html_filename
+                html_filename,
+                node_hardware_info=node_hardware_info
             )
             
         return report
@@ -692,6 +764,15 @@ def main():
             print(f"Infrastructure: {report['infrastructure_type']}")
         if report.get("run_uuid"):
             print(f"Run UUID: {report['run_uuid']}")
+        
+        # Display node hardware information
+        if report.get("node_hardware"):
+            hw = report["node_hardware"]
+            print(f"\nNode Hardware Information:")
+            print(f"  Instance Type: {hw['instance_type']}")
+            print(f"  CPU Cores: {hw['cpu_cores']}")
+            print(f"  Memory: {hw['memory_gb']} GB")
+            print(f"  Architecture: {hw['architecture']}")
             
         print(report["summary"])
         

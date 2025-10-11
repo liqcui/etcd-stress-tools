@@ -343,106 +343,7 @@ class fioAnalyzerUtils:
             self.logger.error(f"Failed to load data from {filename}: {e}")
             raise
             
-    def generate_test_report_html(self, results: List[Dict], 
-                                output_file: str = "fio_report.html") -> None:
-        """Generate HTML report from test results"""
-        html_template = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>FIO Benchmark Report</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; }}
-        .header {{ background-color: #f0f0f0; padding: 20px; border-radius: 5px; }}
-        .test-result {{ margin: 20px 0; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }}
-        .success {{ border-left: 5px solid #4CAF50; }}
-        .failure {{ border-left: 5px solid #f44336; }}
-        table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
-        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-        th {{ background-color: #f2f2f2; }}
-        .metric {{ font-weight: bold; }}
-        .timestamp {{ color: #666; font-size: 0.9em; }}
-        .runuuid {{ color: #333; font-size: 0.9em; }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>FIO Benchmark Report</h1>
-        <p class="timestamp">Generated: {timestamp}</p>
-        <p class="runuuid">Run UUID: {run_uuid}</p>
-        <p>Total Tests: {total_tests} | Successful: {successful} | Failed: {failed}</p>
-    </div>
-    
-    {test_results}
-</body>
-</html>
-"""
 
-        test_results_html = []
-        successful_tests = 0
-        failed_tests = 0
-        
-        for result in results:
-            if result.get('error'):
-                failed_tests += 1
-                status_class = "failure"
-                status_text = f"FAILED: {result['error']}"
-            else:
-                successful_tests += 1
-                status_class = "success"
-                status_text = "SUCCESS"
-                
-            # Build metrics table
-            metrics_html = "<table><tr><th>Metric</th><th>Value</th><th>Unit</th></tr>"
-            
-            metrics = [
-                ("Test Name", result.get('test_name', 'N/A'), ""),
-                ("Node", result.get('node_name', 'N/A'), ""),
-                ("IOPS Read", result.get('iops_read', 'N/A'), "ops/sec"),
-                ("IOPS Write", result.get('iops_write', 'N/A'), "ops/sec"),
-                ("Bandwidth Read", result.get('bw_read_mbs', 'N/A'), "MB/s"),
-                ("Bandwidth Write", result.get('bw_write_mbs', 'N/A'), "MB/s"),
-                ("Completion Latency Avg", result.get('lat_clat_avg_us', 'N/A'), "μs"),
-                ("Completion Latency P99", result.get('lat_clat_p99_us', 'N/A'), "μs"),
-                ("Sync Latency Avg", result.get('sync_avg_us', 'N/A'), "μs"),
-                ("CPU System", result.get('cpu_sys_pct', 'N/A'), "%"),
-                ("Disk Utilization", result.get('disk_util_pct', 'N/A'), "%"),
-                ("Runtime", result.get('runtime_ms', 'N/A'), "ms"),
-            ]
-            
-            for metric, value, unit in metrics:
-                if value is not None and value != 'N/A':
-                    if isinstance(value, float):
-                        value = f"{value:.2f}"
-                    metrics_html += f"<tr><td class='metric'>{metric}</td><td>{value}</td><td>{unit}</td></tr>"
-                    
-            metrics_html += "</table>"
-            
-            test_html = f"""
-            <div class="test-result {status_class}">
-                <h3>{result.get('test_name', 'Unknown Test')} - {status_text}</h3>
-                <p class="timestamp">Timestamp: {result.get('timestamp', 'N/A')}</p>
-                {metrics_html}
-            </div>
-            """
-            test_results_html.append(test_html)
-            
-        # Generate final HTML
-        run_uuid = None
-        if results and isinstance(results[0], dict):
-            run_uuid = results[0].get('run_uuid')
-        run_uuid = run_uuid or "N/A"
-        final_html = html_template.format(
-            timestamp=datetime.now().isoformat(),
-            total_tests=len(results),
-            successful=successful_tests,
-            failed=failed_tests,
-            test_results="\n".join(test_results_html),
-            run_uuid=run_uuid
-        )
-        
-        with open(output_file, 'w') as f:
-            f.write(final_html)
             
         self.logger.info(f"HTML report generated: {output_file}")
         
@@ -1056,5 +957,153 @@ class fioAnalyzerUtils:
         
         return "\n".join(lines)
 
+    def generate_test_report_html(self, results: List[Dict], 
+                                    output_file: str = "fio_report.html",
+                                    node_hardware_info = None) -> None:
+            """Generate HTML report from test results with node hardware information"""
+            
+            # Build hardware info HTML section
+            hardware_html = ""
+            if node_hardware_info:
+                hardware_html = f"""
+            <div class="hardware-info">
+                <h2>Node Hardware Information</h2>
+                <table>
+                    <tr>
+                        <th>Property</th>
+                        <th>Value</th>
+                    </tr>
+                    <tr>
+                        <td class='metric'>Instance Type</td>
+                        <td>{node_hardware_info.instance_type}</td>
+                    </tr>
+                    <tr>
+                        <td class='metric'>CPU Cores</td>
+                        <td>{node_hardware_info.cpu_cores}</td>
+                    </tr>
+                    <tr>
+                        <td class='metric'>Memory</td>
+                        <td>{node_hardware_info.memory_gb} GB</td>
+                    </tr>
+                    <tr>
+                        <td class='metric'>Architecture</td>
+                        <td>{node_hardware_info.architecture}</td>
+                    </tr>
+                </table>
+            </div>
+            """
+            
+            html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>FIO Benchmark Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }}
+            .header {{ background-color: #2c3e50; color: white; padding: 20px; border-radius: 5px; margin-bottom: 20px; }}
+            .header h1 {{ margin: 0 0 10px 0; }}
+            .header p {{ margin: 5px 0; }}
+            .hardware-info {{ background-color: #ecf0f1; padding: 15px; border-radius: 5px; margin-bottom: 20px; border-left: 5px solid #3498db; }}
+            .hardware-info h2 {{ margin-top: 0; color: #2c3e50; }}
+            .test-result {{ margin: 20px 0; border: 1px solid #ddd; padding: 15px; border-radius: 5px; background-color: white; }}
+            .success {{ border-left: 5px solid #4CAF50; }}
+            .failure {{ border-left: 5px solid #f44336; }}
+            table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #34495e; color: white; }}
+            .metric {{ font-weight: bold; }}
+            .timestamp {{ color: #7f8c8d; font-size: 0.9em; }}
+            .runuuid {{ color: #95a5a6; font-size: 0.9em; }}
+            .status-badge {{ display: inline-block; padding: 5px 10px; border-radius: 3px; font-weight: bold; }}
+            .status-success {{ background-color: #d4edda; color: #155724; }}
+            .status-failure {{ background-color: #f8d7da; color: #721c24; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🚀 FIO Benchmark Report</h1>
+            <p class="timestamp">📅 Generated: {timestamp}</p>
+            <p class="runuuid">🆔 Run UUID: {run_uuid}</p>
+            <p>
+                <span class="status-badge status-success">✓ Successful: {successful}</span>
+                <span class="status-badge status-failure">✗ Failed: {failed}</span>
+                <span style="color: #ecf0f1;">Total Tests: {total_tests}</span>
+            </p>
+        </div>
+        
+        {hardware_info}
+        
+        {test_results}
+    </body>
+    </html>
+    """
 
-
+            test_results_html = []
+            successful_tests = 0
+            failed_tests = 0
+            
+            for result in results:
+                if result.get('error'):
+                    failed_tests += 1
+                    status_class = "failure"
+                    status_text = f"❌ FAILED: {result['error']}"
+                else:
+                    successful_tests += 1
+                    status_class = "success"
+                    status_text = "✅ SUCCESS"
+                    
+                # Build metrics table
+                metrics_html = "<table><tr><th>Metric</th><th>Value</th><th>Unit</th></tr>"
+                
+                metrics = [
+                    ("Test Name", result.get('test_name', 'N/A'), ""),
+                    ("Node", result.get('node_name', 'N/A'), ""),
+                    ("IOPS Read", result.get('iops_read', 'N/A'), "ops/sec"),
+                    ("IOPS Write", result.get('iops_write', 'N/A'), "ops/sec"),
+                    ("Bandwidth Read", result.get('bw_read_mbs', 'N/A'), "MB/s"),
+                    ("Bandwidth Write", result.get('bw_write_mbs', 'N/A'), "MB/s"),
+                    ("Completion Latency Avg", result.get('lat_clat_avg_us', 'N/A'), "μs"),
+                    ("Completion Latency P99", result.get('lat_clat_p99_us', 'N/A'), "μs"),
+                    ("Sync Latency Avg", result.get('sync_avg_us', 'N/A'), "μs"),
+                    ("CPU System", result.get('cpu_sys_pct', 'N/A'), "%"),
+                    ("Disk Utilization", result.get('disk_util_pct', 'N/A'), "%"),
+                    ("Runtime", result.get('runtime_ms', 'N/A'), "ms"),
+                ]
+                
+                for metric, value, unit in metrics:
+                    if value is not None and value != 'N/A':
+                        if isinstance(value, float):
+                            value = f"{value:.2f}"
+                        metrics_html += f"<tr><td class='metric'>{metric}</td><td>{value}</td><td>{unit}</td></tr>"
+                        
+                metrics_html += "</table>"
+                
+                test_html = f"""
+                <div class="test-result {status_class}">
+                    <h3>{result.get('test_name', 'Unknown Test')} - {status_text}</h3>
+                    <p class="timestamp">⏰ Timestamp: {result.get('timestamp', 'N/A')}</p>
+                    {metrics_html}
+                </div>
+                """
+                test_results_html.append(test_html)
+                
+            # Generate final HTML
+            run_uuid = None
+            if results and isinstance(results[0], dict):
+                run_uuid = results[0].get('run_uuid')
+            run_uuid = run_uuid or "N/A"
+            
+            final_html = html_template.format(
+                timestamp=datetime.now().isoformat(),
+                total_tests=len(results),
+                successful=successful_tests,
+                failed=failed_tests,
+                test_results="\n".join(test_results_html),
+                run_uuid=run_uuid,
+                hardware_info=hardware_html
+            )
+            
+            with open(output_file, 'w') as f:
+                f.write(final_html)
+                
+            self.logger.info(f"HTML report generated: {output_file}")
