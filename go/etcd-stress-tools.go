@@ -1343,7 +1343,7 @@ func (e *EtcdStressTools) createImages(ctx context.Context) error {
 		Resource: "images",
 	}
 
-	imageCount := e.config.TotalNamespaces * 5
+	imageCount := e.config.TotalNamespaces * 3
 	semaphore := make(chan struct{}, e.config.MaxConcurrentOperations)
 	var wg sync.WaitGroup
 	var mu sync.Mutex

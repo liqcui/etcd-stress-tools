@@ -1203,8 +1203,8 @@ class etcdStressTools:
                 self.log_warn(f"Failed to create Image {name}: {e}", "IMAGE")
                 return False
 
-        # Create namespace * 5 images
-        image_count = self.config.total_namespaces * 5
+        # Create namespace * 3 images
+        image_count = self.config.total_namespaces * 3
         semaphore = asyncio.Semaphore(self.config.max_concurrent_operations)
         
         async def create_with_semaphore(name: str) -> bool:
