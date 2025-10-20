@@ -117,11 +117,11 @@ func NewConfig() *Config {
 		NamespaceParallel:          getEnvInt("NAMESPACE_PARALLEL", 5),
 		NamespacePrefix:            getEnvString("NAMESPACE_PREFIX", "stress-test"),
 		SmallConfigMapsPerNS:       10,
-		LargeConfigMapsPerNS:       3,
+		LargeConfigMapsPerNS:       2,
 		LargeConfigMapSizeMB:       1.0,
 		TotalLargeConfigMapLimitGB: getEnvFloat("TOTAL_LARGE_CONFIGMAP_LIMIT_GB", 6.0),
 		SmallSecretsPerNS:          10,
-		LargeSecretsPerNS:          10,
+		LargeSecretsPerNS:          3,
 		CreateDeployments:          getEnvBool("CREATE_DEPLOYMENTS", true),
 		DeploymentsPerNS:           3,
 		CreateEgressFirewall:       getEnvBool("CREATE_EGRESS_FIREWALL", true),
@@ -460,7 +460,7 @@ func (e *EtcdStressTools) createSmallConfigMaps(ctx context.Context, namespace s
 	return nil
 }
 
-// createLargeConfigMaps creates 3 large ConfigMaps with 1MB size each
+// createLargeConfigMaps creates 1 large ConfigMaps with 1MB size each
 func (e *EtcdStressTools) createLargeConfigMaps(ctx context.Context, namespace string) error {
 	totalLargeConfigMaps := e.config.TotalNamespaces * e.config.LargeConfigMapsPerNS
 	totalSizeGB := float64(totalLargeConfigMaps) * e.config.LargeConfigMapSizeMB / 1024

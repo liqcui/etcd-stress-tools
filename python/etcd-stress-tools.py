@@ -55,12 +55,12 @@ class Config:
         
         # ConfigMap and Secret counts (fixed as per requirements)
         self.small_configmaps_per_ns = 10
-        self.large_configmaps_per_ns = 3
+        self.large_configmaps_per_ns = 2
         self.large_configmap_size_mb = 1.0
         self.total_large_configmap_limit_gb = float(os.getenv('TOTAL_LARGE_CONFIGMAP_LIMIT_GB', '6'))
         
         self.small_secrets_per_ns = 10
-        self.large_secrets_per_ns = 10
+        self.large_secrets_per_ns = 3
         
         # Deployment configuration (optional)
         self.create_deployments = os.getenv('CREATE_DEPLOYMENTS', 'true').lower() == 'true'
