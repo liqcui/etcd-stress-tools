@@ -289,8 +289,8 @@ class DeploymentTestTool:
                                     command=["/bin/sleep", "infinity"],
                                     volume_mounts=volume_mounts,
                                     resources=client.V1ResourceRequirements(
-                                        requests={"memory": "64Mi", "cpu": "50m"},
-                                        limits={"memory": "128Mi", "cpu": "100m"}
+                                        # requests={"memory": "64Mi", "cpu": "50m"},
+                                        # limits={"memory": "128Mi", "cpu": "100m"}
                                     )
                                 )
                             ],

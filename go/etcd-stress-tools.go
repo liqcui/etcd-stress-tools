@@ -50,6 +50,7 @@ const (
 )
 
 // Config holds all configuration options
+// Config holds all configuration options
 type Config struct {
 	TotalNamespaces            int
 	NamespaceParallel          int
@@ -62,6 +63,10 @@ type Config struct {
 	LargeSecretsPerNS          int
 	CreateDeployments          bool
 	DeploymentsPerNS           int
+	DeploymentSmallCMCount     int
+	DeploymentLargeCMCount     int
+	DeploymentSmallSecretCount int
+	DeploymentLargeSecretCount int
 	CreateEgressFirewall       bool
 	CreateNetworkPolicies      bool
 	CreateANPBANP              bool
@@ -111,19 +116,24 @@ type EtcdStressTools struct {
 }
 
 // NewConfig creates a new Config with defaults from environment variables
+// NewConfig creates a new Config with defaults from environment variables
 func NewConfig() *Config {
 	config := &Config{
 		TotalNamespaces:            getEnvInt("TOTAL_NAMESPACES", 100),
 		NamespaceParallel:          getEnvInt("NAMESPACE_PARALLEL", 5),
 		NamespacePrefix:            getEnvString("NAMESPACE_PREFIX", "stress-test"),
 		SmallConfigMapsPerNS:       10,
-		LargeConfigMapsPerNS:       2,
+		LargeConfigMapsPerNS:       1,
 		LargeConfigMapSizeMB:       1.0,
 		TotalLargeConfigMapLimitGB: getEnvFloat("TOTAL_LARGE_CONFIGMAP_LIMIT_GB", 6.0),
 		SmallSecretsPerNS:          10,
-		LargeSecretsPerNS:          3,
+		LargeSecretsPerNS:          1,
 		CreateDeployments:          getEnvBool("CREATE_DEPLOYMENTS", true),
 		DeploymentsPerNS:           3,
+		DeploymentSmallCMCount:     getEnvInt("DEPLOYMENT_SMALL_CM_COUNT", 5),
+		DeploymentLargeCMCount:     getEnvInt("DEPLOYMENT_LARGE_CM_COUNT", 1),
+		DeploymentSmallSecretCount: getEnvInt("DEPLOYMENT_SMALL_SECRET_COUNT", 5),
+		DeploymentLargeSecretCount: getEnvInt("DEPLOYMENT_LARGE_SECRET_COUNT", 1),
 		CreateEgressFirewall:       getEnvBool("CREATE_EGRESS_FIREWALL", true),
 		CreateNetworkPolicies:      getEnvBool("CREATE_NETWORK_POLICIES", true),
 		CreateANPBANP:              getEnvBool("CREATE_ANP_BANP", true),
@@ -786,7 +796,8 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 			var volumes []corev1.Volume
 			var volumeMounts []corev1.VolumeMount
 
-			for j := 0; j < 5; j++ {
+			// Mount small ConfigMaps (configurable count)
+			for j := 0; j < e.config.DeploymentSmallCMCount; j++ {
 				cmName := fmt.Sprintf("small-cm-%d", j+1)
 				volumeName := fmt.Sprintf("small-cm-%d", j)
 				volumes = append(volumes, corev1.Volume{
@@ -803,20 +814,26 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 				})
 			}
 
-			volumes = append(volumes, corev1.Volume{
-				Name: "large-cm-0",
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{Name: "large-cm-1"},
+			// Mount large ConfigMaps (configurable count)
+			for j := 0; j < e.config.DeploymentLargeCMCount; j++ {
+				cmName := fmt.Sprintf("large-cm-%d", j+1)
+				volumeName := fmt.Sprintf("large-cm-%d", j)
+				volumes = append(volumes, corev1.Volume{
+					Name: volumeName,
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: cmName},
+						},
 					},
-				},
-			})
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      "large-cm-0",
-				MountPath: "/config/large-cm/0",
-			})
+				})
+				volumeMounts = append(volumeMounts, corev1.VolumeMount{
+					Name:      volumeName,
+					MountPath: fmt.Sprintf("/config/large-cm/%d", j),
+				})
+			}
 
-			for j := 0; j < 5; j++ {
+			// Mount small Secrets (configurable count)
+			for j := 0; j < e.config.DeploymentSmallSecretCount; j++ {
 				secretName := fmt.Sprintf("small-secret-%d", j+1)
 				volumeName := fmt.Sprintf("small-secret-%d", j)
 				volumes = append(volumes, corev1.Volume{
@@ -833,7 +850,8 @@ func (e *EtcdStressTools) createDeployments(ctx context.Context, namespace strin
 				})
 			}
 
-			for j := 0; j < 5; j++ {
+			// Mount large Secrets (configurable count)
+			for j := 0; j < e.config.DeploymentLargeSecretCount; j++ {
 				secretName := fmt.Sprintf("large-secret-%d", j+1)
 				volumeName := fmt.Sprintf("large-secret-%d", j)
 				volumes = append(volumes, corev1.Volume{
@@ -2048,23 +2066,27 @@ func (e *EtcdStressTools) runComprehensiveTest(ctx context.Context) error {
 
 func main() {
 	var (
-		totalNamespaces   = flag.Int("total-namespaces", 0, "Total number of namespaces to create")
-		namespaceParallel = flag.Int("namespace-parallel", 0, "Number of namespaces to process in parallel")
-		namespacePrefix   = flag.String("namespace-prefix", "", "Prefix for namespace names")
-		largeLimit        = flag.Float64("large-limit", 0, "Total limit for large ConfigMaps in GB")
-		enableDeployments = flag.Bool("enable-deployments", false, "Enable deployment creation")
-		noEgressFirewall  = flag.Bool("no-egress-firewall", false, "Disable EgressFirewall creation")
-		noNetworkPolicies = flag.Bool("no-network-policies", false, "Disable NetworkPolicy creation")
-		noANPBANP         = flag.Bool("no-anp-banp", false, "Disable ANP/BANP creation")
-		noImages          = flag.Bool("no-images", false, "Disable Image creation")
-		maxConcurrent     = flag.Int("max-concurrent", 0, "Maximum concurrent operations")
-		namespaceTimeout  = flag.Int("namespace-timeout", 0, "Timeout for namespace readiness in seconds")
-		retryCount        = flag.Int("retry-count", 0, "Number of retries for failed operations")
-		retryDelay        = flag.Float64("retry-delay", 0, "Delay between retries in seconds")
-		cleanup           = flag.Bool("cleanup", false, "Enable cleanup after completion")
-		logLevel          = flag.String("log-level", "", "Set logging level")
-		listOnly          = flag.Bool("list-only", false, "Only list existing resources without creating")
-		help              = flag.Bool("help", false, "Show help message")
+		totalNamespaces        = flag.Int("total-namespaces", 0, "Total number of namespaces to create")
+		namespaceParallel      = flag.Int("namespace-parallel", 0, "Number of namespaces to process in parallel")
+		namespacePrefix        = flag.String("namespace-prefix", "", "Prefix for namespace names")
+		largeLimit             = flag.Float64("large-limit", 0, "Total limit for large ConfigMaps in GB")
+		enableDeployments      = flag.Bool("enable-deployments", false, "Enable deployment creation")
+		deploySmallCMCount     = flag.Int("deploy-small-cm-count", 0, "Number of small ConfigMaps to mount per deployment")
+		deployLargeCMCount     = flag.Int("deploy-large-cm-count", 0, "Number of large ConfigMaps to mount per deployment")
+		deploySmallSecretCount = flag.Int("deploy-small-secret-count", 0, "Number of small Secrets to mount per deployment")
+		deployLargeSecretCount = flag.Int("deploy-large-secret-count", 0, "Number of large Secrets to mount per deployment")
+		noEgressFirewall       = flag.Bool("no-egress-firewall", false, "Disable EgressFirewall creation")
+		noNetworkPolicies      = flag.Bool("no-network-policies", false, "Disable NetworkPolicy creation")
+		noANPBANP              = flag.Bool("no-anp-banp", false, "Disable ANP/BANP creation")
+		noImages               = flag.Bool("no-images", false, "Disable Image creation")
+		maxConcurrent          = flag.Int("max-concurrent", 0, "Maximum concurrent operations")
+		namespaceTimeout       = flag.Int("namespace-timeout", 0, "Timeout for namespace readiness in seconds")
+		retryCount             = flag.Int("retry-count", 1, "Number of retries for failed operations")
+		retryDelay             = flag.Float64("retry-delay", 5, "Delay between retries in seconds")
+		cleanup                = flag.Bool("cleanup", false, "Enable cleanup after completion")
+		logLevel               = flag.String("log-level", "", "Set logging level")
+		listOnly               = flag.Bool("list-only", false, "Only list existing resources without creating")
+		help                   = flag.Bool("help", false, "Show help message")
 	)
 
 	flag.Usage = func() {
@@ -2100,6 +2122,18 @@ Usage:
 	}
 	if *enableDeployments {
 		config.CreateDeployments = true
+	}
+	if *deploySmallCMCount != 0 {
+		config.DeploymentSmallCMCount = *deploySmallCMCount
+	}
+	if *deployLargeCMCount != 0 {
+		config.DeploymentLargeCMCount = *deployLargeCMCount
+	}
+	if *deploySmallSecretCount != 0 {
+		config.DeploymentSmallSecretCount = *deploySmallSecretCount
+	}
+	if *deployLargeSecretCount != 0 {
+		config.DeploymentLargeSecretCount = *deployLargeSecretCount
 	}
 	if *noEgressFirewall {
 		config.CreateEgressFirewall = false

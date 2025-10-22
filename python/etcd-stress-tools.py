@@ -55,16 +55,20 @@ class Config:
         
         # ConfigMap and Secret counts (fixed as per requirements)
         self.small_configmaps_per_ns = 10
-        self.large_configmaps_per_ns = 2
+        self.large_configmaps_per_ns = 1
         self.large_configmap_size_mb = 1.0
         self.total_large_configmap_limit_gb = float(os.getenv('TOTAL_LARGE_CONFIGMAP_LIMIT_GB', '6'))
         
         self.small_secrets_per_ns = 10
-        self.large_secrets_per_ns = 3
+        self.large_secrets_per_ns = 1
         
         # Deployment configuration (optional)
         self.create_deployments = os.getenv('CREATE_DEPLOYMENTS', 'true').lower() == 'true'
         self.deployments_per_ns = 3
+        self.deployment_mount_small_configmaps = int(os.getenv('DEPLOYMENT_MOUNT_SMALL_CONFIGMAPS', '5'))
+        self.deployment_mount_large_configmaps = int(os.getenv('DEPLOYMENT_MOUNT_LARGE_CONFIGMAPS', '1'))
+        self.deployment_mount_small_secrets = int(os.getenv('DEPLOYMENT_MOUNT_SMALL_SECRETS', '5'))
+        self.deployment_mount_large_secrets = int(os.getenv('DEPLOYMENT_MOUNT_LARGE_SECRETS', '1'))
         
         # Network policy configuration
         self.create_egress_firewall = os.getenv('CREATE_EGRESS_FIREWALL', 'true').lower() == 'true'
@@ -577,17 +581,19 @@ class etcdStressTools:
         cert_pem = cert.public_bytes(serialization.Encoding.PEM)
         return base64.b64encode(cert_pem).decode('utf-8')
 
-    # 2.5 Create 5 deployments with mounted configmaps and secrets
+# 2.5 Create 5 deployments with mounted configmaps and secrets
     async def create_deployments(self, namespace: str) -> bool:
-        """Create 5 deployments with mounted ConfigMaps and Secrets, and wait for pods to be ready"""
+        """Create deployments with configurable mounted ConfigMaps and Secrets, and wait for pods to be ready"""
         async def create_deployment(name: str) -> bool:
             try:
                 # Create volume mounts for ConfigMaps and Secrets
                 volumes = []
                 volume_mounts = []
                 
-                # Mount 5 small configmaps
-                for i in range(5):
+                # Mount small configmaps (configurable count)
+                mount_small_cm_count = min(self.config.deployment_mount_small_configmaps, 
+                                          self.config.small_configmaps_per_ns)
+                for i in range(mount_small_cm_count):
                     cm_name = f"small-cm-{i+1}"
                     volume_name = f"small-cm-{i}"
                     volumes.append(client.V1Volume(
@@ -599,18 +605,25 @@ class etcdStressTools:
                         mount_path=f"/config/small-cm/{i}"
                     ))
                 
-                # Mount 1 large configmap
-                volumes.append(client.V1Volume(
-                    name="large-cm-0",
-                    config_map=client.V1ConfigMapVolumeSource(name="large-cm-1")
-                ))
-                volume_mounts.append(client.V1VolumeMount(
-                    name="large-cm-0",
-                    mount_path="/config/large-cm/0"
-                ))
+                # Mount large configmaps (configurable count)
+                mount_large_cm_count = min(self.config.deployment_mount_large_configmaps,
+                                          self.config.large_configmaps_per_ns)
+                for i in range(mount_large_cm_count):
+                    cm_name = f"large-cm-{i+1}"
+                    volume_name = f"large-cm-{i}"
+                    volumes.append(client.V1Volume(
+                        name=volume_name,
+                        config_map=client.V1ConfigMapVolumeSource(name=cm_name)
+                    ))
+                    volume_mounts.append(client.V1VolumeMount(
+                        name=volume_name,
+                        mount_path=f"/config/large-cm/{i}"
+                    ))
                 
-                # Mount 5 small secrets
-                for i in range(5):
+                # Mount small secrets (configurable count)
+                mount_small_secret_count = min(self.config.deployment_mount_small_secrets,
+                                              self.config.small_secrets_per_ns)
+                for i in range(mount_small_secret_count):
                     secret_name = f"small-secret-{i+1}"
                     volume_name = f"small-secret-{i}"
                     volumes.append(client.V1Volume(
@@ -622,8 +635,10 @@ class etcdStressTools:
                         mount_path=f"/secrets/small/{i}"
                     ))
                 
-                # Mount 5 large secrets
-                for i in range(5):
+                # Mount large secrets (configurable count)
+                mount_large_secret_count = min(self.config.deployment_mount_large_secrets,
+                                              self.config.large_secrets_per_ns)
+                for i in range(mount_large_secret_count):
                     secret_name = f"large-secret-{i+1}"
                     volume_name = f"large-secret-{i}"
                     volumes.append(client.V1Volume(
@@ -634,6 +649,14 @@ class etcdStressTools:
                         name=volume_name,
                         mount_path=f"/secrets/large/{i}"
                     ))
+                
+                # Create container spec
+                container = client.V1Container(
+                    name="stress-test-app",
+                    image="registry.access.redhat.com/ubi8/ubi-minimal:latest",
+                    command=["sleep", "infinity"],
+                    volume_mounts=volume_mounts
+                )
                 
                 # Create deployment spec
                 deployment_body = client.V1Deployment(
@@ -652,18 +675,7 @@ class etcdStressTools:
                                 labels={'app': name, 'stress-test': 'true'}
                             ),
                             spec=client.V1PodSpec(
-                                containers=[
-                                    client.V1Container(
-                                        name="stress-container",
-                                        image="registry.access.redhat.com/ubi8/ubi-minimal:latest",
-                                        command=["/bin/sleep", "infinity"],
-                                        volume_mounts=volume_mounts,
-                                        resources=client.V1ResourceRequirements(
-                                            requests={"memory": "64Mi", "cpu": "50m"},
-                                            limits={"memory": "128Mi", "cpu": "100m"}
-                                        )
-                                    )
-                                ],
+                                containers=[container],
                                 volumes=volumes
                             )
                         )
@@ -677,31 +689,23 @@ class etcdStressTools:
                     body=deployment_body
                 )
                 
-                # Wait for deployment pods to be ready
-                is_ready = await self.wait_for_deployment_ready(namespace, name)
-                if not is_ready:
-                    self.log_warn(f"Deployment {name} created but pods not ready in time", "DEPLOYMENT")
-                
-                return is_ready
+                # Wait for deployment to be ready
+                return await self.wait_for_deployment_ready(namespace, name)
                 
             except ApiException as e:
                 if e.status == 409:
-                    # Already exists, check if ready
-                    return await self.wait_for_deployment_ready(namespace, name)
-                self.log_warn(f"Failed to create Deployment {name} in {namespace}: {e}", "DEPLOYMENT")
+                    return True
+                self.log_warn(f"Failed to create deployment {name} in {namespace}: {e}", "DEPLOYMENT")
                 return False
-
-        if not self.config.create_deployments:
-            return True
-
+        
         # Create semaphore for concurrency control
         semaphore = asyncio.Semaphore(self.config.max_concurrent_operations)
         
         async def create_with_semaphore(name: str) -> bool:
             async with semaphore:
                 return await create_deployment(name)
-
-        # Create 5 deployments in parallel
+        
+        # Create deployments in parallel
         tasks = [
             create_with_semaphore(f"stress-deployment-{i+1}") 
             for i in range(self.config.deployments_per_ns)
@@ -709,8 +713,6 @@ class etcdStressTools:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         success_count = sum(1 for result in results if result is True)
-        
-        self.log_info(f"Created {success_count}/{len(tasks)} deployments with ready pods in {namespace}", "DEPLOYMENT")
         return success_count == len(tasks)
 
     async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 300) -> bool:
@@ -2045,6 +2047,14 @@ Examples:
     # Optional features
     parser.add_argument('--enable-deployments', action='store_true',
                        help='Enable deployment creation')
+    parser.add_argument('--mount-small-configmaps', type=int,
+                       help='Number of small ConfigMaps to mount per deployment')
+    parser.add_argument('--mount-large-configmaps', type=int,
+                       help='Number of large ConfigMaps to mount per deployment')
+    parser.add_argument('--mount-small-secrets', type=int,
+                       help='Number of small Secrets to mount per deployment')
+    parser.add_argument('--mount-large-secrets', type=int,
+                       help='Number of large Secrets to mount per deployment')
     parser.add_argument('--no-egress-firewall', action='store_true',
                        help='Disable EgressFirewall creation')
     parser.add_argument('--no-network-policies', action='store_true',
@@ -2094,6 +2104,14 @@ async def main():
         config.total_large_configmap_limit_gb = args.large_limit
     if args.enable_deployments:
         config.create_deployments = True
+    if args.mount_small_configmaps is not None:
+        config.deployment_mount_small_configmaps = args.mount_small_configmaps
+    if args.mount_large_configmaps is not None:
+        config.deployment_mount_large_configmaps = args.mount_large_configmaps
+    if args.mount_small_secrets is not None:
+        config.deployment_mount_small_secrets = args.mount_small_secrets
+    if args.mount_large_secrets is not None:
+        config.deployment_mount_large_secrets = args.mount_large_secrets
     if args.no_egress_firewall:
         config.create_egress_firewall = False
     if args.no_network_policies:
