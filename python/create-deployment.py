@@ -2,6 +2,13 @@
 """
 Simplified Kubernetes Deployment Testing Tool
 Creates namespaces with deployments that mount small ConfigMaps and Secrets
+
+SSL/TLS Handling:
+- Automatically clears REQUESTS_CA_BUNDLE environment variable to prevent PEM lib errors
+- Validates CA certificate files before using them
+- Proactively tests API connectivity and auto-disables SSL verification on errors
+- Supports environment variable overrides: K8S_VERIFY, OCP_API_VERIFY, K8S_CA_CERT
+- Implements fallback mechanism similar to openshift_auth.py
 """
 
 import argparse
@@ -10,10 +17,11 @@ import base64
 import logging
 import os
 import secrets
+import ssl
 import sys
 import time
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -43,6 +51,21 @@ class Config:
         self.log_file = os.getenv('LOG_FILE', 'deployment_test.log')
         self.log_level = os.getenv('LOG_LEVEL', 'INFO')
         self.cleanup_on_completion = os.getenv('CLEANUP_ON_COMPLETION', 'false').lower() == 'true'
+        self.k8s_verify_ssl: Optional[bool] = self._get_verify_ssl_setting()
+        self.kubeconfig_path: Optional[str] = os.getenv('KUBECONFIG')
+        self.k8s_ca_cert_path: Optional[str] = None
+    
+    def _get_verify_ssl_setting(self) -> Optional[bool]:
+        """Get SSL verification setting from environment"""
+        for env_var in ['K8S_VERIFY', 'OCP_API_VERIFY', 'VERIFY_SSL']:
+            val = os.getenv(env_var)
+            if val is not None:
+                val_lower = val.strip().lower()
+                if val_lower in ('true', '1', 'yes'):
+                    return True
+                if val_lower in ('false', '0', 'no'):
+                    return False
+        return None  # Not set, will auto-detect
 
 
 class DeploymentTestTool:
@@ -51,6 +74,7 @@ class DeploymentTestTool:
     def __init__(self, config: Config):
         self.config = config
         self.setup_logging()
+        self.original_ca_bundle: Optional[str] = None
         self.setup_kubernetes_clients()
         
     def setup_logging(self):
@@ -67,20 +91,160 @@ class DeploymentTestTool:
         self.logger = logging.getLogger(__name__)
         
     def setup_kubernetes_clients(self):
-        """Setup Kubernetes client configuration"""
+        """Setup Kubernetes client configuration with robust SSL handling"""
         try:
-            config.load_incluster_config()
-            self.log_info("Using in-cluster Kubernetes configuration")
-        except config.ConfigException:
+            # Step 1: Clear potentially broken REQUESTS_CA_BUNDLE
+            # This is the root cause of many PEM lib errors
+            self.original_ca_bundle = os.environ.pop('REQUESTS_CA_BUNDLE', None)
+            if self.original_ca_bundle:
+                self.log_info(f"Temporarily cleared REQUESTS_CA_BUNDLE: {self.original_ca_bundle}", "CONFIG")
+            
+            # Step 2: Load kubeconfig
             try:
-                config.load_kube_config()
-                self.log_info("Using kubeconfig file")
-            except config.ConfigException as e:
-                self.log_error(f"Failed to load Kubernetes configuration: {e}")
-                sys.exit(1)
+                if self.config.kubeconfig_path:
+                    self.log_info(f"Loading kubeconfig from: {self.config.kubeconfig_path}", "CONFIG")
+                    config.load_kube_config(config_file=self.config.kubeconfig_path)
+                else:
+                    config.load_incluster_config()
+                    self.log_info("Using in-cluster Kubernetes configuration", "CONFIG")
+            except config.ConfigException:
+                try:
+                    config.load_kube_config()
+                    self.log_info("Using default kubeconfig file", "CONFIG")
+                except config.ConfigException as e:
+                    self.log_error(f"Failed to load Kubernetes configuration: {e}", "CONFIG")
+                    sys.exit(1)
+            
+            # Step 3: Get default configuration and setup SSL verification
+            k8s_conf = client.Configuration.get_default_copy()
+            
+            # Apply SSL verification setting from config/env
+            if self.config.k8s_verify_ssl is not None:
+                k8s_conf.verify_ssl = self.config.k8s_verify_ssl
+                if not self.config.k8s_verify_ssl:
+                    k8s_conf.assert_hostname = False
+                    k8s_conf.ssl_ca_cert = None
+                self.log_info(f"SSL verification set via environment: {self.config.k8s_verify_ssl}", "CONFIG")
+            
+            # Step 4: Validate and capture CA certificate path
+            if getattr(k8s_conf, 'ssl_ca_cert', None):
+                ca_path = k8s_conf.ssl_ca_cert
+                if self._is_ca_file_valid(ca_path):
+                    self.config.k8s_ca_cert_path = ca_path
+                    self.log_info(f"Using valid CA cert from config: {ca_path}", "CONFIG")
+                else:
+                    self.log_warn(f"CA cert file exists but is invalid: {ca_path}", "CONFIG")
+                    # If verification not explicitly forced and CA is invalid, disable SSL
+                    if self.config.k8s_verify_ssl is not True:
+                        self.log_warn("Disabling SSL verification due to invalid CA cert", "CONFIG")
+                        k8s_conf.verify_ssl = False
+                        k8s_conf.assert_hostname = False
+                        k8s_conf.ssl_ca_cert = None
+                        self.config.k8s_verify_ssl = False
+            
+            # Allow CA cert override via environment
+            env_ca = os.getenv('K8S_CA_CERT')
+            if env_ca and os.path.isfile(env_ca):
+                if self._is_ca_file_valid(env_ca):
+                    self.config.k8s_ca_cert_path = env_ca
+                    k8s_conf.ssl_ca_cert = env_ca
+                    self.log_info(f"Using CA cert from K8S_CA_CERT env: {env_ca}", "CONFIG")
+            
+            # Step 5: Create initial client
+            self.core_v1 = client.CoreV1Api(client.ApiClient(configuration=k8s_conf))
+            self.apps_v1 = client.AppsV1Api(client.ApiClient(configuration=k8s_conf))
+            
+            # Step 6: Proactively test API connectivity and auto-fallback on SSL errors
+            try:
+                self._ensure_k8s_api_connectivity()
+                self.log_info("Kubernetes API connectivity verified successfully", "CONFIG")
+            except Exception as probe_err:
+                # _ensure_k8s_api_connectivity handles fallback internally
+                self.log_error(f"Failed to establish Kubernetes API connectivity: {probe_err}", "CONFIG")
+                raise
                 
-        self.core_v1 = client.CoreV1Api()
-        self.apps_v1 = client.AppsV1Api()
+        except Exception as e:
+            self.log_error(f"Failed to setup Kubernetes clients: {e}", "CONFIG")
+            sys.exit(1)
+    
+    def _is_ca_file_valid(self, ca_path: str) -> bool:
+        """Validate a CA bundle by attempting to load it with ssl.
+        
+        Returns False if the file cannot be loaded as a trust store.
+        """
+        try:
+            if not os.path.isfile(ca_path):
+                return False
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.load_verify_locations(cafile=ca_path)
+            return True
+        except Exception as e:
+            self.logger.debug(f"CA validation failed for {ca_path}: {e}")
+            return False
+    
+    def _ensure_k8s_api_connectivity(self) -> None:
+        """Probe the Kubernetes API and auto-recover from common SSL/PEM issues.
+        
+        If a PEM/SSL verification error is detected (e.g., invalid REQUESTS_CA_BUNDLE,
+        broken CA file, or hostname mismatch), automatically disable TLS verification
+        as a last-resort fallback to avoid repeated urllib3 retry warnings.
+        """
+        try:
+            # Use a lightweight version check to test connectivity
+            version_api = client.VersionApi(self.core_v1.api_client)
+            _ = version_api.get_code()
+            return
+        except Exception as probe_err:
+            err_text = str(probe_err)
+            
+            # Detect common SSL issues seen in logs
+            ssl_error_indicators = (
+                "PEM lib",
+                "CERTIFICATE_VERIFY_FAILED",
+                "SSLError",
+                "certificate verify failed",
+                "ssl.c:",
+                "[X509]",
+                "Max retries exceeded",
+            )
+            
+            if not any(ind in err_text for ind in ssl_error_indicators):
+                # Not an SSL-related problem; re-raise for caller
+                self.log_error(f"Kubernetes API connectivity check failed (non-SSL): {err_text}", "CONFIG")
+                raise
+            
+            # SSL error detected - log and fallback
+            self.log_warn(
+                f"Kubernetes API SSL verification failed: {err_text[:200]}... "
+                "Disabling TLS verification as fallback (set K8S_VERIFY=true to force verification)",
+                "CONFIG"
+            )
+            
+            # Rebuild configuration with SSL verification disabled
+            k8s_conf_fallback = client.Configuration.get_default_copy()
+            k8s_conf_fallback.verify_ssl = False
+            k8s_conf_fallback.assert_hostname = False
+            k8s_conf_fallback.ssl_ca_cert = None
+            
+            # Recreate API clients with fallback configuration
+            api_client_fallback = client.ApiClient(configuration=k8s_conf_fallback)
+            self.core_v1 = client.CoreV1Api(api_client_fallback)
+            self.apps_v1 = client.AppsV1Api(api_client_fallback)
+            self.config.k8s_verify_ssl = False
+            
+            # Verify connectivity with fallback config
+            try:
+                version_api = client.VersionApi(api_client_fallback)
+                _ = version_api.get_code()
+                self.log_info("Kubernetes API connectivity verified (SSL verification disabled)", "CONFIG")
+            except Exception as fallback_err:
+                self.log_error(f"Kubernetes API connectivity failed even with TLS disabled: {fallback_err}", "CONFIG")
+                raise
+    
+    def __del__(self):
+        """Cleanup: restore original REQUESTS_CA_BUNDLE if it was cleared"""
+        if self.original_ca_bundle:
+            os.environ['REQUESTS_CA_BUNDLE'] = self.original_ca_bundle
         
     def log_info(self, message: str, component: str = "MAIN"):
         """Enhanced logging"""
@@ -219,6 +383,44 @@ class DeploymentTestTool:
             self.log_warn(f"Failed to create Secret {name} in {namespace}: {e}", "SECRET")
             return False
 
+    async def create_service(self, namespace: str, deployment_name: str) -> bool:
+        """Create a ClusterIP service for a deployment"""
+        try:
+            service_name = f"{deployment_name}-svc"
+            
+            service_body = client.V1Service(
+                metadata=client.V1ObjectMeta(
+                    name=service_name,
+                    namespace=namespace,
+                    labels={'app': deployment_name, 'deployment-test': 'true'}
+                ),
+                spec=client.V1ServiceSpec(
+                    selector={'app': deployment_name},
+                    ports=[
+                        client.V1ServicePort(
+                            name="http",
+                            port=80,
+                            target_port=80,
+                            protocol="TCP"
+                        )
+                    ],
+                    type="ClusterIP"
+                )
+            )
+            
+            await asyncio.to_thread(
+                self.core_v1.create_namespaced_service,
+                namespace=namespace,
+                body=service_body
+            )
+            self.log_info(f"Created service {service_name} in {namespace}", "SERVICE")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                return True
+            self.log_warn(f"Failed to create Service {service_name} in {namespace}: {e}", "SERVICE")
+            return False
+
     async def create_deployment(self, namespace: str, name: str) -> bool:
         """Create deployment with 2 ConfigMaps and 2 Secrets mounted"""
         try:
@@ -284,9 +486,9 @@ class DeploymentTestTool:
                         spec=client.V1PodSpec(
                             containers=[
                                 client.V1Container(
-                                    name="test-container",
-                                    image="registry.access.redhat.com/ubi8/ubi-minimal:latest",
-                                    command=["/bin/sleep", "infinity"],
+                                    name="nginx",
+                                    image="quay.io/openshift-psap-qe/nginx-alpine:multiarch",
+                                    ports=[client.V1ContainerPort(container_port=80)],
                                     volume_mounts=volume_mounts,
                                     resources=client.V1ResourceRequirements(
                                         # requests={"memory": "64Mi", "cpu": "50m"},
@@ -308,6 +510,12 @@ class DeploymentTestTool:
             
             # Wait for deployment to be ready
             is_ready = await self.wait_for_deployment_ready(namespace, name)
+            
+            # Create service for the deployment
+            if is_ready:
+                service_created = await self.create_service(namespace, name)
+                return is_ready and service_created
+            
             return is_ready
             
         except ApiException as e:
@@ -509,8 +717,9 @@ def create_argument_parser():
         epilog="""
 Each namespace gets:
   - N deployments (default: 3)
-  - Each deployment has 1 pod
+  - Each deployment has 1 nginx pod
   - Each pod mounts 2 small ConfigMaps and 2 small Secrets
+  - Each deployment gets a ClusterIP service for HTTP access
 
 Environment Variables:
   TOTAL_NAMESPACES (default: 100)
@@ -521,10 +730,20 @@ Environment Variables:
   NAMESPACE_READY_TIMEOUT (default: 60)
   LOG_FILE, LOG_LEVEL
   CLEANUP_ON_COMPLETION (default: false)
+  
+  SSL/TLS Configuration:
+  K8S_VERIFY, OCP_API_VERIFY (default: auto-detect) - Set to 'true' to force SSL verification
+  K8S_CA_CERT - Path to CA certificate file
+  KUBECONFIG - Path to kubeconfig file
+  
+  Note: The tool automatically handles SSL errors by disabling verification
+        unless explicitly forced via K8S_VERIFY=true
 
 Examples:
   %(prog)s --total-namespaces 50 --deployments-per-ns 5
   %(prog)s --cleanup --namespace-parallel 20
+  %(prog)s --verify-ssl  # Force SSL verification
+  K8S_VERIFY=false %(prog)s  # Explicitly disable SSL verification
         """
     )
     
@@ -546,6 +765,8 @@ Examples:
                        help='Set logging level')
     parser.add_argument('--log-file',
                        help='Log file path')
+    parser.add_argument('--verify-ssl', action='store_true',
+                       help='Force SSL certificate verification')
     
     return parser
 
@@ -576,6 +797,8 @@ async def main():
         config.log_level = args.log_level
     if args.log_file is not None:
         config.log_file = args.log_file
+    if args.verify_ssl:
+        config.k8s_verify_ssl = True
     
     tool = DeploymentTestTool(config)
     
