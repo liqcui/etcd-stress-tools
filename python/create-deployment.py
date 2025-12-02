@@ -2,6 +2,7 @@
 """
 Simplified Kubernetes Deployment Testing Tool
 Creates namespaces with deployments that mount small ConfigMaps and Secrets
+Includes connectivity test pods that curl nginx services and log timing
 
 SSL/TLS Handling:
 - Automatically clears REQUESTS_CA_BUNDLE environment variable to prevent PEM lib errors
@@ -54,6 +55,9 @@ class Config:
         self.k8s_verify_ssl: Optional[bool] = self._get_verify_ssl_setting()
         self.kubeconfig_path: Optional[str] = os.getenv('KUBECONFIG')
         self.k8s_ca_cert_path: Optional[str] = None
+        self.curl_test_enabled = os.getenv('CURL_TEST_ENABLED', 'true').lower() == 'true'
+        self.curl_test_interval = int(os.getenv('CURL_TEST_INTERVAL', '30'))  # seconds between curls
+        self.curl_test_count = int(os.getenv('CURL_TEST_COUNT', '10'))  # number of curl attempts
     
     def _get_verify_ssl_setting(self) -> Optional[bool]:
         """Get SSL verification setting from environment"""
@@ -399,8 +403,8 @@ class DeploymentTestTool:
                     ports=[
                         client.V1ServicePort(
                             name="http",
-                            port=80,
-                            target_port=80,
+                            port=8080,
+                            target_port=8080,
                             protocol="TCP"
                         )
                     ],
@@ -419,6 +423,109 @@ class DeploymentTestTool:
             if e.status == 409:
                 return True
             self.log_warn(f"Failed to create Service {service_name} in {namespace}: {e}", "SERVICE")
+            return False
+
+    async def create_curl_test_pod(self, namespace: str, service_names: list) -> bool:
+        """Create a pod that curls all services in the namespace and logs timing"""
+        try:
+            pod_name = "connectivity-test"
+            
+            # Build curl command that tests all services
+            curl_commands = []
+            for service_name in service_names:
+                service_url = f"http://{service_name}:8080"
+                # Use curl with detailed timing and diagnostics
+                curl_cmd = f"""
+echo "=== Testing {service_name} at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+
+# Perform curl with detailed timing
+curl_output=$(curl -o /dev/null -s -w "time_namelookup: %{{time_namelookup}}s\\ntime_connect: %{{time_connect}}s\\ntime_starttransfer: %{{time_starttransfer}}s\\ntime_total: %{{time_total}}s\\nhttp_code: %{{http_code}}" --connect-timeout 10 --max-time 15 {service_url} 2>&1)
+curl_exit=$?
+
+if [ $curl_exit -eq 0 ]; then
+    echo "SUCCESS: Connected to {service_name}"
+    echo "$curl_output" | while IFS= read -r line; do echo "  $line"; done
+else
+    echo "FAILED: Could not connect to {service_name} (exit code: $curl_exit)"
+    echo "Curl error details:"
+    case $curl_exit in
+        6) echo "  - Could not resolve host" ;;
+        7) echo "  - Failed to connect to host (pod may not be ready yet)" ;;
+        28) echo "  - Connection timeout" ;;
+        *) echo "  - Unknown error code: $curl_exit" ;;
+    esac
+fi
+echo "---"
+"""
+                curl_commands.append(curl_cmd)
+            
+            # Create a script that runs continuously with initial wait
+            full_script = f"""#!/bin/sh
+echo "Starting connectivity tests in namespace {namespace}"
+echo "Test interval: {self.config.curl_test_interval}s"
+echo "Number of iterations: {self.config.curl_test_count}"
+echo "================================================"
+echo ""
+echo "Waiting 30 seconds for all services and pods to be fully ready..."
+sleep 30
+echo "Starting tests now..."
+echo ""
+
+for i in $(seq 1 {self.config.curl_test_count}); do
+    echo "### Iteration $i of {self.config.curl_test_count} ###"
+    {"".join(curl_commands)}
+    
+    if [ $i -lt {self.config.curl_test_count} ]; then
+        echo "Sleeping {self.config.curl_test_interval}s before next iteration..."
+        sleep {self.config.curl_test_interval}
+        echo ""
+    fi
+done
+
+echo ""
+echo "================================================"
+echo "Connectivity tests completed in namespace {namespace}"
+echo "Pod will continue running. Use 'kubectl logs -f {pod_name}' to view results."
+
+# Keep pod running after tests complete
+tail -f /dev/null
+"""
+            
+            pod_body = client.V1Pod(
+                metadata=client.V1ObjectMeta(
+                    name=pod_name,
+                    namespace=namespace,
+                    labels={'app': 'connectivity-test', 'deployment-test': 'true'}
+                ),
+                spec=client.V1PodSpec(
+                    restart_policy="Always",
+                    containers=[
+                        client.V1Container(
+                            name="curl-tester",
+                            image="alpine/curl:latest",
+                            command=["/bin/sh", "-c"],
+                            args=[full_script],
+                            resources=client.V1ResourceRequirements(
+                                requests={"memory": "64Mi", "cpu": "50m"},
+                                limits={"memory": "128Mi", "cpu": "100m"}
+                            )
+                        )
+                    ]
+                )
+            )
+            
+            await asyncio.to_thread(
+                self.core_v1.create_namespaced_pod,
+                namespace=namespace,
+                body=pod_body
+            )
+            self.log_info(f"Created connectivity test pod in {namespace}", "CURL_TEST")
+            return True
+            
+        except ApiException as e:
+            if e.status == 409:
+                return True
+            self.log_warn(f"Failed to create connectivity test pod in {namespace}: {e}", "CURL_TEST")
             return False
 
     async def create_deployment(self, namespace: str, name: str) -> bool:
@@ -488,7 +595,7 @@ class DeploymentTestTool:
                                 client.V1Container(
                                     name="nginx",
                                     image="quay.io/openshift-psap-qe/nginx-alpine:multiarch",
-                                    ports=[client.V1ContainerPort(container_port=80)],
+                                    ports=[client.V1ContainerPort(container_port=8080)],
                                     volume_mounts=volume_mounts,
                                     resources=client.V1ResourceRequirements(
                                         # requests={"memory": "64Mi", "cpu": "50m"},
@@ -601,6 +708,19 @@ class DeploymentTestTool:
         error_count = len(tasks) - success_count
         
         self.log_info(f"Created {success_count}/{len(tasks)} deployments in {namespace_name}", "DEPLOYMENT")
+        
+        # Create connectivity test pod if enabled and deployments succeeded
+        if self.config.curl_test_enabled and success_count > 0:
+            # Wait a bit longer to ensure services are fully ready
+            self.log_info(f"Waiting 10s before creating connectivity test pod in {namespace_name}", "CURL_TEST")
+            await asyncio.sleep(10)
+            
+            service_names = [f"deploy-{i+1}-svc" for i in range(self.config.deployments_per_ns)]
+            curl_pod_created = await self.create_curl_test_pod(namespace_name, service_names)
+            
+            if curl_pod_created:
+                self.log_info(f"Connectivity test pod created in {namespace_name}. Use: kubectl logs -f connectivity-test -n {namespace_name}", "CURL_TEST")
+        
         return {"success": success_count, "errors": error_count}
 
     async def create_all_namespaces_and_deployments(self):
@@ -713,13 +833,14 @@ class DeploymentTestTool:
 def create_argument_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
-        description='Simplified Kubernetes Deployment Testing Tool',
+        description='Simplified Kubernetes Deployment Testing Tool with Connectivity Tests',
         epilog="""
 Each namespace gets:
   - N deployments (default: 3)
   - Each deployment has 1 nginx pod
   - Each pod mounts 2 small ConfigMaps and 2 small Secrets
   - Each deployment gets a ClusterIP service for HTTP access
+  - 1 connectivity test pod that curls all services and logs timing
 
 Environment Variables:
   TOTAL_NAMESPACES (default: 100)
@@ -730,6 +851,11 @@ Environment Variables:
   NAMESPACE_READY_TIMEOUT (default: 60)
   LOG_FILE, LOG_LEVEL
   CLEANUP_ON_COMPLETION (default: false)
+  
+  Connectivity Test Configuration:
+  CURL_TEST_ENABLED (default: true) - Enable/disable connectivity tests
+  CURL_TEST_INTERVAL (default: 30) - Seconds between curl tests
+  CURL_TEST_COUNT (default: 10) - Number of curl iterations per pod
   
   SSL/TLS Configuration:
   K8S_VERIFY, OCP_API_VERIFY (default: auto-detect) - Set to 'true' to force SSL verification
@@ -743,7 +869,13 @@ Examples:
   %(prog)s --total-namespaces 50 --deployments-per-ns 5
   %(prog)s --cleanup --namespace-parallel 20
   %(prog)s --verify-ssl  # Force SSL verification
-  K8S_VERIFY=false %(prog)s  # Explicitly disable SSL verification
+  %(prog)s --curl-interval 60 --curl-count 5  # Custom curl test settings
+  
+  # View connectivity test logs
+  kubectl logs -f connectivity-test -n deploy-test-1
+  
+  # Disable connectivity tests
+  CURL_TEST_ENABLED=false %(prog)s
         """
     )
     
@@ -767,6 +899,14 @@ Examples:
                        help='Log file path')
     parser.add_argument('--verify-ssl', action='store_true',
                        help='Force SSL certificate verification')
+    parser.add_argument('--curl-test-enabled', action='store_true', default=None,
+                       help='Enable connectivity tests (default: true)')
+    parser.add_argument('--no-curl-test', action='store_true',
+                       help='Disable connectivity tests')
+    parser.add_argument('--curl-interval', type=int,
+                       help='Seconds between curl tests')
+    parser.add_argument('--curl-count', type=int,
+                       help='Number of curl test iterations')
     
     return parser
 
@@ -799,6 +939,14 @@ async def main():
         config.log_file = args.log_file
     if args.verify_ssl:
         config.k8s_verify_ssl = True
+    if args.curl_test_enabled is not None:
+        config.curl_test_enabled = True
+    if args.no_curl_test:
+        config.curl_test_enabled = False
+    if args.curl_interval is not None:
+        config.curl_test_interval = args.curl_interval
+    if args.curl_count is not None:
+        config.curl_test_count = args.curl_count
     
     tool = DeploymentTestTool(config)
     

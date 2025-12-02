@@ -65,10 +65,15 @@ class Config:
         # Deployment configuration (optional)
         self.create_deployments = os.getenv('CREATE_DEPLOYMENTS', 'true').lower() == 'true'
         self.deployments_per_ns = 3
-        self.deployment_mount_small_configmaps = int(os.getenv('DEPLOYMENT_MOUNT_SMALL_CONFIGMAPS', '5'))
-        self.deployment_mount_large_configmaps = int(os.getenv('DEPLOYMENT_MOUNT_LARGE_CONFIGMAPS', '1'))
-        self.deployment_mount_small_secrets = int(os.getenv('DEPLOYMENT_MOUNT_SMALL_SECRETS', '5'))
-        self.deployment_mount_large_secrets = int(os.getenv('DEPLOYMENT_MOUNT_LARGE_SECRETS', '1'))
+        self.deployment_mount_small_configmaps = int(os.getenv('DEPLOYMENT_MOUNT_SMALL_CONFIGMAPS', '2'))
+        self.deployment_mount_large_configmaps = int(os.getenv('DEPLOYMENT_MOUNT_LARGE_CONFIGMAPS', '0'))
+        self.deployment_mount_small_secrets = int(os.getenv('DEPLOYMENT_MOUNT_SMALL_SECRETS', '2'))
+        self.deployment_mount_large_secrets = int(os.getenv('DEPLOYMENT_MOUNT_LARGE_SECRETS', '0'))
+        
+        # Connectivity test configuration
+        self.curl_test_enabled = os.getenv('CURL_TEST_ENABLED', 'true').lower() == 'true'
+        self.curl_test_interval = int(os.getenv('CURL_TEST_INTERVAL', '30'))  # seconds between curls
+        self.curl_test_count = int(os.getenv('CURL_TEST_COUNT', '10'))  # number of curl attempts
         
         # Network policy configuration
         self.create_egress_firewall = os.getenv('CREATE_EGRESS_FIREWALL', 'true').lower() == 'true'
@@ -214,44 +219,8 @@ class etcdStressTools:
                     await asyncio.sleep(0.5)
                     continue
                 
-                # Additional check: try to create a dummy resource to verify namespace is ready
-                try:
-                    test_cm_name = f"test-readiness-{int(time.time())}"
-                    test_cm = client.V1ConfigMap(
-                        metadata=client.V1ObjectMeta(
-                            name=test_cm_name,
-                            namespace=namespace_name
-                        ),
-                        data={"test": "readiness"}
-                    )
-                    
-                    await asyncio.to_thread(
-                        self.core_v1.create_namespaced_config_map,
-                        namespace=namespace_name,
-                        body=test_cm
-                    )
-                    
-                    # Clean up test resource
-                    try:
-                        await asyncio.to_thread(
-                            self.core_v1.delete_namespaced_config_map,
-                            name=test_cm_name,
-                            namespace=namespace_name
-                        )
-                    except:
-                        pass  # Ignore cleanup errors
-                    
-                    self.log_info(f"Namespace {namespace_name} is ready for resource creation", "NAMESPACE")
-                    return True
-                    
-                except ApiException as test_e:
-                    if test_e.status == 404:  # Namespace still not ready
-                        await asyncio.sleep(0.5)
-                        continue
-                    else:
-                        # Other API errors during test - namespace might be ready
-                        self.log_warn(f"Test resource creation failed in {namespace_name}, but namespace appears ready: {test_e}", "NAMESPACE")
-                        return True
+                self.log_info(f"Namespace {namespace_name} is ready", "NAMESPACE")
+                return True
                         
             except ApiException as e:
                 if e.status == 404:
@@ -347,9 +316,9 @@ class etcdStressTools:
         success_count = sum(1 for result in results if result is True)
         return success_count == len(tasks)
 
-    # 2.2 Create 3 large configmaps with 1MB each
+    # 2.2 Create large configmaps
     async def create_large_configmap(self, namespace: str) -> bool:
-        """Create 3 large ConfigMaps with 1MB size each in parallel"""
+        """Create large ConfigMaps with 1MB size each in parallel"""
         async def create_single_large_configmap(name: str) -> bool:
             try:
                 # Generate 1MB of data
@@ -398,7 +367,7 @@ class etcdStressTools:
             async with semaphore:
                 return await create_single_large_configmap(name)
 
-        # Create 3 large configmaps in parallel
+        # Create large configmaps in parallel
         tasks = [
             create_with_semaphore(f"large-cm-{i+1}") 
             for i in range(self.config.large_configmaps_per_ns)
@@ -459,9 +428,9 @@ class etcdStressTools:
         success_count = sum(1 for result in results if result is True)
         return success_count == len(tasks)
 
-    # 2.4 Create 10 large secrets in parallel
+    # 2.4 Create large secrets in parallel
     async def create_large_secrets(self, namespace: str) -> bool:
-        """Create 10 large Secrets in namespace in parallel"""
+        """Create large Secrets in namespace in parallel"""
         async def create_large_secret(name: str) -> bool:
             try:
                 # Generate certificate and key data
@@ -506,7 +475,7 @@ class etcdStressTools:
             async with semaphore:
                 return await create_large_secret(name)
 
-        # Create 10 large secrets in parallel
+        # Create large secrets in parallel
         tasks = [
             create_with_semaphore(f"large-secret-{i+1}") 
             for i in range(self.config.large_secrets_per_ns)
@@ -581,9 +550,149 @@ class etcdStressTools:
         cert_pem = cert.public_bytes(serialization.Encoding.PEM)
         return base64.b64encode(cert_pem).decode('utf-8')
 
-# 2.5 Create 5 deployments with mounted configmaps and secrets
+    async def create_service(self, namespace: str, deployment_name: str) -> bool:
+        """Create a ClusterIP service for a deployment"""
+        try:
+            service_name = f"{deployment_name}-svc"
+            
+            service_body = client.V1Service(
+                metadata=client.V1ObjectMeta(
+                    name=service_name,
+                    namespace=namespace,
+                    labels={'app': deployment_name, 'stress-test': 'true'}
+                ),
+                spec=client.V1ServiceSpec(
+                    selector={'app': deployment_name},
+                    ports=[
+                        client.V1ServicePort(
+                            name="http",
+                            port=8080,
+                            target_port=8080,
+                            protocol="TCP"
+                        )
+                    ],
+                    type="ClusterIP"
+                )
+            )
+            
+            await asyncio.to_thread(
+                self.core_v1.create_namespaced_service,
+                namespace=namespace,
+                body=service_body
+            )
+            self.log_info(f"Created service {service_name} in {namespace}", "SERVICE")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                return True
+            self.log_warn(f"Failed to create Service {service_name} in {namespace}: {e}", "SERVICE")
+            return False
+
+    async def create_curl_test_pod(self, namespace: str, service_names: list) -> bool:
+        """Create a pod that curls all services in the namespace and logs timing"""
+        try:
+            pod_name = "connectivity-test"
+            
+            # Build curl command that tests all services
+            curl_commands = []
+            for service_name in service_names:
+                service_url = f"http://{service_name}:8080"
+                # Use curl with detailed timing and diagnostics
+                curl_cmd = f"""
+echo "=== Testing {service_name} at $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+
+# Perform curl with detailed timing
+curl_output=$(curl -o /dev/null -s -w "time_namelookup: %{{time_namelookup}}s\\ntime_connect: %{{time_connect}}s\\ntime_starttransfer: %{{time_starttransfer}}s\\ntime_total: %{{time_total}}s\\nhttp_code: %{{http_code}}" --connect-timeout 10 --max-time 15 {service_url} 2>&1)
+curl_exit=$?
+
+if [ $curl_exit -eq 0 ]; then
+    echo "SUCCESS: Connected to {service_name}"
+    echo "$curl_output" | while IFS= read -r line; do echo "  $line"; done
+else
+    echo "FAILED: Could not connect to {service_name} (exit code: $curl_exit)"
+    echo "Curl error details:"
+    case $curl_exit in
+        6) echo "  - Could not resolve host" ;;
+        7) echo "  - Failed to connect to host (pod may not be ready yet)" ;;
+        28) echo "  - Connection timeout" ;;
+        *) echo "  - Unknown error code: $curl_exit" ;;
+    esac
+fi
+echo "---"
+"""
+                curl_commands.append(curl_cmd)
+            
+            # Create a script that runs continuously with initial wait
+            full_script = f"""#!/bin/sh
+echo "Starting connectivity tests in namespace {namespace}"
+echo "Test interval: {self.config.curl_test_interval}s"
+echo "Number of iterations: {self.config.curl_test_count}"
+echo "================================================"
+echo ""
+echo "Waiting 30 seconds for all services and pods to be fully ready..."
+sleep 30
+echo "Starting tests now..."
+echo ""
+
+for i in $(seq 1 {self.config.curl_test_count}); do
+    echo "### Iteration $i of {self.config.curl_test_count} ###"
+    {"".join(curl_commands)}
+    
+    if [ $i -lt {self.config.curl_test_count} ]; then
+        echo "Sleeping {self.config.curl_test_interval}s before next iteration..."
+        sleep {self.config.curl_test_interval}
+        echo ""
+    fi
+done
+
+echo ""
+echo "================================================"
+echo "Connectivity tests completed in namespace {namespace}"
+echo "Pod will continue running. Use 'kubectl logs -f {pod_name}' to view results."
+
+# Keep pod running after tests complete
+tail -f /dev/null
+"""
+            
+            pod_body = client.V1Pod(
+                metadata=client.V1ObjectMeta(
+                    name=pod_name,
+                    namespace=namespace,
+                    labels={'app': 'connectivity-test', 'stress-test': 'true'}
+                ),
+                spec=client.V1PodSpec(
+                    restart_policy="Always",
+                    containers=[
+                        client.V1Container(
+                            name="curl-tester",
+                            image="alpine/curl:latest",
+                            command=["/bin/sh", "-c"],
+                            args=[full_script],
+                            resources=client.V1ResourceRequirements(
+                                requests={"memory": "64Mi", "cpu": "50m"},
+                                limits={"memory": "128Mi", "cpu": "100m"}
+                            )
+                        )
+                    ]
+                )
+            )
+            
+            await asyncio.to_thread(
+                self.core_v1.create_namespaced_pod,
+                namespace=namespace,
+                body=pod_body
+            )
+            self.log_info(f"Created connectivity test pod in {namespace}", "CURL_TEST")
+            return True
+            
+        except ApiException as e:
+            if e.status == 409:
+                return True
+            self.log_warn(f"Failed to create connectivity test pod in {namespace}: {e}", "CURL_TEST")
+            return False
+
     async def create_deployments(self, namespace: str) -> bool:
-        """Create deployments with configurable mounted ConfigMaps and Secrets, and wait for pods to be ready"""
+        """Create deployments with mounted ConfigMaps and Secrets, services, and wait for pods to be ready"""
         async def create_deployment(name: str) -> bool:
             try:
                 # Create volume mounts for ConfigMaps and Secrets
@@ -595,14 +704,14 @@ class etcdStressTools:
                                           self.config.small_configmaps_per_ns)
                 for i in range(mount_small_cm_count):
                     cm_name = f"small-cm-{i+1}"
-                    volume_name = f"small-cm-{i}"
+                    volume_name = f"cm-vol-{i}"
                     volumes.append(client.V1Volume(
                         name=volume_name,
                         config_map=client.V1ConfigMapVolumeSource(name=cm_name)
                     ))
                     volume_mounts.append(client.V1VolumeMount(
                         name=volume_name,
-                        mount_path=f"/config/small-cm/{i}"
+                        mount_path=f"/config/cm-{i}"
                     ))
                 
                 # Mount large configmaps (configurable count)
@@ -625,14 +734,14 @@ class etcdStressTools:
                                               self.config.small_secrets_per_ns)
                 for i in range(mount_small_secret_count):
                     secret_name = f"small-secret-{i+1}"
-                    volume_name = f"small-secret-{i}"
+                    volume_name = f"secret-vol-{i}"
                     volumes.append(client.V1Volume(
                         name=volume_name,
                         secret=client.V1SecretVolumeSource(secret_name=secret_name)
                     ))
                     volume_mounts.append(client.V1VolumeMount(
                         name=volume_name,
-                        mount_path=f"/secrets/small/{i}"
+                        mount_path=f"/secrets/secret-{i}"
                     ))
                 
                 # Mount large secrets (configurable count)
@@ -650,15 +759,7 @@ class etcdStressTools:
                         mount_path=f"/secrets/large/{i}"
                     ))
                 
-                # Create container spec
-                container = client.V1Container(
-                    name="stress-test-app",
-                    image="registry.access.redhat.com/ubi8/ubi-minimal:latest",
-                    command=["sleep", "infinity"],
-                    volume_mounts=volume_mounts
-                )
-                
-                # Create deployment spec
+                # Create deployment with nginx
                 deployment_body = client.V1Deployment(
                     metadata=client.V1ObjectMeta(
                         name=name,
@@ -675,7 +776,18 @@ class etcdStressTools:
                                 labels={'app': name, 'stress-test': 'true'}
                             ),
                             spec=client.V1PodSpec(
-                                containers=[container],
+                                containers=[
+                                    client.V1Container(
+                                        name="nginx",
+                                        image="quay.io/openshift-psap-qe/nginx-alpine:multiarch",
+                                        ports=[client.V1ContainerPort(container_port=8080)],
+                                        volume_mounts=volume_mounts,
+                                        resources=client.V1ResourceRequirements(
+                                            requests={"memory": "64Mi", "cpu": "50m"},
+                                            limits={"memory": "128Mi", "cpu": "100m"}
+                                        )
+                                    )
+                                ],
                                 volumes=volumes
                             )
                         )
@@ -690,11 +802,18 @@ class etcdStressTools:
                 )
                 
                 # Wait for deployment to be ready
-                return await self.wait_for_deployment_ready(namespace, name)
+                is_ready = await self.wait_for_deployment_ready(namespace, name)
+                
+                # Create service for the deployment
+                if is_ready:
+                    service_created = await self.create_service(namespace, name)
+                    return is_ready and service_created
+                
+                return is_ready
                 
             except ApiException as e:
                 if e.status == 409:
-                    return True
+                    return await self.wait_for_deployment_ready(namespace, name)
                 self.log_warn(f"Failed to create deployment {name} in {namespace}: {e}", "DEPLOYMENT")
                 return False
         
@@ -713,6 +832,21 @@ class etcdStressTools:
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         success_count = sum(1 for result in results if result is True)
+        
+        self.log_info(f"Created {success_count}/{len(tasks)} deployments in {namespace}", "DEPLOYMENT")
+        
+        # Create connectivity test pod if enabled and deployments succeeded
+        if self.config.curl_test_enabled and success_count > 0:
+            # Wait a bit longer to ensure services are fully ready
+            self.log_info(f"Waiting 10s before creating connectivity test pod in {namespace}", "CURL_TEST")
+            await asyncio.sleep(10)
+            
+            service_names = [f"stress-deployment-{i+1}-svc" for i in range(self.config.deployments_per_ns)]
+            curl_pod_created = await self.create_curl_test_pod(namespace, service_names)
+            
+            if curl_pod_created:
+                self.log_info(f"Connectivity test pod created in {namespace}. Use: kubectl logs -f connectivity-test -n {namespace}", "CURL_TEST")
+        
         return success_count == len(tasks)
 
     async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 300) -> bool:
@@ -754,7 +888,6 @@ class etcdStressTools:
                     ]
                     
                     if len(running_pods) == spec_replicas:
-                        self.log_info(f"Deployment {deployment_name} is ready with {spec_replicas} pods running", "DEPLOYMENT")
                         return True
                 
                 await asyncio.sleep(2)
@@ -1245,8 +1378,7 @@ class etcdStressTools:
         
         results = {"success": 0, "errors": 0}
         
-        # Step 2: Create all resource types in sequence to avoid race conditions
-        # First create ConfigMaps and Secrets (required for deployments)
+        # Step 2: Create ConfigMaps and Secrets first (required for deployments)
         resource_tasks = [
             ("small_configmaps", self.create_small_configmaps(namespace_name)),
             ("large_configmap", self.create_large_configmap(namespace_name)),
@@ -1304,91 +1436,18 @@ class etcdStressTools:
     async def create_all_namespaces_and_resources(self):
         """Create all namespaces and their resources with proper coordination"""
         self.log_info(f"Creating {self.config.total_namespaces} namespaces with resources", "MAIN")
+        start_time = time.time()
         
-        # Step 1: Create all namespaces first in small batches
-        self.log_info("Phase 1: Creating all namespaces", "MAIN")
-        namespace_creation_semaphore = asyncio.Semaphore(self.config.namespace_parallel)
+        # Create semaphore for namespace processing
+        semaphore = asyncio.Semaphore(self.config.namespace_parallel)
         
-        async def create_namespace_only(ns_idx: int) -> bool:
-            async with namespace_creation_semaphore:
-                namespace_name = f"{self.config.namespace_prefix}-{ns_idx}"
-                tenant = self.tenant_labels[ns_idx % len(self.tenant_labels)]
-                
-                namespace_labels = {
-                    'customer_tenant': tenant,
-                }
-                if ns_idx % 4 == 0:
-                    namespace_labels['anplabel'] = 'anp-tenant'
-                
-                return await self.ensure_namespace(namespace_name, namespace_labels)
+        async def create_with_semaphore(ns_idx: int) -> Dict[str, int]:
+            async with semaphore:
+                return await self.create_namespace_resources(ns_idx)
         
-        # Create all namespaces
-        namespace_tasks = [
-            create_namespace_only(i) 
-            for i in range(1, self.config.total_namespaces + 1)
-        ]
-        
-        namespace_results = await asyncio.gather(*namespace_tasks, return_exceptions=True)
-        successful_namespaces = sum(1 for result in namespace_results if result is True)
-        
-        self.log_info(f"Created {successful_namespaces}/{self.config.total_namespaces} namespaces", "MAIN")
-        
-        # Step 2: Create resources in all namespaces
-        self.log_info("Phase 2: Creating resources in namespaces", "MAIN")
-        
-        resource_semaphore = asyncio.Semaphore(self.config.namespace_parallel)
-        
-        async def create_resources_only(ns_idx: int) -> Dict[str, int]:
-            async with resource_semaphore:
-                namespace_name = f"{self.config.namespace_prefix}-{ns_idx}"
-                
-                results = {"success": 0, "errors": 0}
-                
-                # Create all resource types concurrently within this namespace
-                resource_tasks = [
-                    ("small_configmaps", self.create_small_configmaps(namespace_name)),
-                    ("large_configmap", self.create_large_configmap(namespace_name)),
-                    ("small_secrets", self.create_small_secrets(namespace_name)),
-                    ("large_secrets", self.create_large_secrets(namespace_name)),
-                ]
-                
-                # Add optional resources
-                if self.config.create_egress_firewall:
-                    resource_tasks.append(("egress_firewall", self.create_egress_firewall(namespace_name)))
-                    
-                if self.config.create_network_policies:
-                    resource_tasks.append(("network_policies", self.create_network_policies(namespace_name)))
-                
-                # Execute core resource tasks
-                task_results = await asyncio.gather(*[task[1] for task in resource_tasks], return_exceptions=True)
-                
-                # Count results
-                for i, result in enumerate(task_results):
-                    if isinstance(result, Exception):
-                        self.log_error(f"Task {resource_tasks[i][0]} failed in {namespace_name}: {result}", "RESOURCE")
-                        results["errors"] += 1
-                    elif result:
-                        results["success"] += 1
-                    else:
-                        results["errors"] += 1
-                
-                # Create deployments after other resources (if enabled)
-                if self.config.create_deployments:
-                    try:
-                        deployment_result = await self.create_deployments(namespace_name)
-                        if deployment_result:
-                            results["success"] += 1
-                        else:
-                            results["errors"] += 1
-                    except Exception as e:
-                        self.log_error(f"Deployment creation failed in {namespace_name}: {e}", "DEPLOYMENT")
-                        results["errors"] += 1
-                
-                return results
-        
-        # Create resource tasks
-        resource_creation_tasks = [
-            create_resources_only(i) 
+        # Create tasks
+        tasks = [
+            create_with_semaphore(i) 
             for i in range(1, self.config.total_namespaces + 1)
         ]
         
@@ -1397,28 +1456,24 @@ class etcdStressTools:
         total_success = 0
         total_errors = 0
         
-        for i in range(0, len(resource_creation_tasks), batch_size):
-            batch = resource_creation_tasks[i:i + batch_size]
+        for i in range(0, len(tasks), batch_size):
+            batch = tasks[i:i + batch_size]
             batch_results = await asyncio.gather(*batch, return_exceptions=True)
             
-            batch_success = 0
-            batch_errors = 0
             for result in batch_results:
                 if isinstance(result, dict):
-                    batch_success += result.get("success", 0)
-                    batch_errors += result.get("errors", 0)
+                    total_success += result.get("success", 0)
+                    total_errors += result.get("errors", 0)
                 else:
-                    batch_errors += 1
-            
-            total_success += batch_success
-            total_errors += batch_errors
+                    total_errors += 1
             
             completed = min(i + batch_size, self.config.total_namespaces)
-            self.log_info(f"Processed resources for {completed}/{self.config.total_namespaces} namespaces "
+            self.log_info(f"Processed {completed}/{self.config.total_namespaces} namespaces "
                          f"(Success: {total_success}, Errors: {total_errors})", "PROGRESS")
         
-        self.log_info(f"Resource creation completed: "
-                     f"Total Success: {total_success}, Total Errors: {total_errors}", "COMPLETE")
+        elapsed_time = time.time() - start_time
+        self.log_info(f"Resource creation completed in {elapsed_time:.2f}s: "
+                     f"Success: {total_success}, Errors: {total_errors}", "COMPLETE")
 
     async def create_global_network_policies(self):
         """Create global network policies (BANP and ANP)"""
@@ -1988,27 +2043,30 @@ class etcdStressTools:
             self.log_error(f"Test failed: {e}", "MAIN")
             raise
 
+
 def create_argument_parser():
     """Create and configure argument parser"""
     parser = argparse.ArgumentParser(
-        description='Optimized OpenShift etcd Stress Testing Tool',
+        description='Optimized OpenShift etcd Stress Testing Tool with Connectivity Tests',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 This tool creates comprehensive Kubernetes resources to stress test etcd:
 
 Resources Created Per Namespace:
   - 10 Small ConfigMaps
-  - 3 Large ConfigMaps (1MB each, with 6GB total limit)
+  - 1 Large ConfigMap (1MB each, with 6GB total limit)
   - 10 Small Secrets 
-  - 10 Large Secrets with certificates
+  - 1 Large Secret with certificates
   - 2 Network Policies per namespace
   - 1 EgressFirewall policy per namespace
-  - 5 Deployments (optional, with volume mounts)
+  - 3 Deployments (optional) with nginx containers
+  - 3 Services (one per deployment)
+  - 1 Connectivity test pod that curls all services
 
 Global Resources:
   - BaselineAdminNetworkPolicy (BANP)
   - AdminNetworkPolicy (ANP) objects (total_namespaces/3)
-  - Images (total_namespaces * 5)
+  - Images (total_namespaces * 3)
 
 Environment Variables:
   TOTAL_NAMESPACES (default: 100)
@@ -2020,6 +2078,18 @@ Environment Variables:
   CREATE_NETWORK_POLICIES (default: true)
   CREATE_ANP_BANP (default: true)
   CREATE_IMAGES (default: true)
+  
+  Connectivity Test Configuration:
+  CURL_TEST_ENABLED (default: true) - Enable/disable connectivity tests
+  CURL_TEST_INTERVAL (default: 30) - Seconds between curl tests
+  CURL_TEST_COUNT (default: 10) - Number of curl iterations per pod
+  
+  Deployment Mount Configuration:
+  DEPLOYMENT_MOUNT_SMALL_CONFIGMAPS (default: 2)
+  DEPLOYMENT_MOUNT_LARGE_CONFIGMAPS (default: 0)
+  DEPLOYMENT_MOUNT_SMALL_SECRETS (default: 2)
+  DEPLOYMENT_MOUNT_LARGE_SECRETS (default: 0)
+  
   MAX_CONCURRENT_OPERATIONS (default: 50)
   NAMESPACE_READY_TIMEOUT (default: 60)
   RESOURCE_RETRY_COUNT (default: 3)
@@ -2031,6 +2101,13 @@ Examples:
   %(prog)s --total-namespaces 50 --namespace-parallel 5
   %(prog)s --large-limit 8 --enable-deployments
   %(prog)s --cleanup --no-images
+  %(prog)s --list-only  # Only list existing resources
+  
+  # View connectivity test logs
+  kubectl logs -f connectivity-test -n stress-test-1
+  
+  # Disable connectivity tests
+  CURL_TEST_ENABLED=false %(prog)s
         """
     )
     
@@ -2064,6 +2141,16 @@ Examples:
     parser.add_argument('--no-images', action='store_true',
                        help='Disable Image creation')
     
+    # Connectivity test options
+    parser.add_argument('--curl-test-enabled', action='store_true', default=None,
+                       help='Enable connectivity tests (default: true)')
+    parser.add_argument('--no-curl-test', action='store_true',
+                       help='Disable connectivity tests')
+    parser.add_argument('--curl-interval', type=int,
+                       help='Seconds between curl tests')
+    parser.add_argument('--curl-count', type=int,
+                       help='Number of curl test iterations')
+    
     # Performance tuning
     parser.add_argument('--max-concurrent', type=int,
                        help='Maximum concurrent operations')
@@ -2084,6 +2171,7 @@ Examples:
     parser.add_argument('--list-only', action='store_true',
                        help='Only list existing resources without creating')    
     return parser
+
 
 async def main():
     """Main execution function"""
@@ -2120,6 +2208,14 @@ async def main():
         config.create_anp_banp = False
     if args.no_images:
         config.create_images = False
+    if args.curl_test_enabled is not None:
+        config.curl_test_enabled = True
+    if args.no_curl_test:
+        config.curl_test_enabled = False
+    if args.curl_interval is not None:
+        config.curl_test_interval = args.curl_interval
+    if args.curl_count is not None:
+        config.curl_test_count = args.curl_count
     if args.max_concurrent is not None:
         config.max_concurrent_operations = args.max_concurrent
     if args.namespace_timeout is not None:
@@ -2152,6 +2248,7 @@ async def main():
     except Exception as e:
         tool.log_error(f"Test failed: {e}", "MAIN")
         sys.exit(1)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
