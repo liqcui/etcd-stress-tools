@@ -67,6 +67,12 @@ class Config:
         self.statefulset_enabled = os.getenv('STATEFULSET_ENABLED', 'true').lower() == 'true'
         self.statefulset_replicas = int(os.getenv('STATEFULSET_REPLICAS', '3'))
         self.statefulsets_per_ns = int(os.getenv('STATEFULSETS_PER_NS', '1'))
+
+        # Build job configuration (similar to CI/CD patterns)
+        self.build_job_enabled = os.getenv('BUILD_JOB_ENABLED', 'false').lower() == 'true'
+        self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '5'))
+        self.build_parallelism = int(os.getenv('BUILD_PARALLELISM', '3'))
+        self.build_timeout = int(os.getenv('BUILD_TIMEOUT', '600'))
     
     def _get_verify_ssl_setting(self) -> Optional[bool]:
         """Get SSL verification setting from environment"""
@@ -837,6 +843,154 @@ go run /tmp/sim.go
         self.log_warn(f"Timeout waiting for StatefulSet {statefulset_name} pods to start", "STATEFULSET")
         return False
 
+    async def create_build_job(self, namespace: str, name: str) -> bool:
+        """Create a Job that simulates CI/CD build workload
+
+        Simulates build jobs similar to customer CI/CD patterns but with generic naming.
+        Each job creates multiple pods (completions) with controlled parallelism to
+        simulate build pod churn similar to Jenkins/Tekton builds.
+        """
+        try:
+            # Use batch API for Jobs
+            batch_v1 = client.BatchV1Api(self.core_v1.api_client)
+
+            # Simulate build script that runs for random duration
+            build_script = """#!/bin/bash
+set -e
+
+echo "=== Build Job: ${JOB_NAME} ==="
+echo "Started at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "Namespace: ${NAMESPACE}"
+echo ""
+
+# Simulate build preparation
+echo "Step 1/5: Preparing build environment..."
+sleep $((RANDOM % 5 + 2))
+
+echo "Step 2/5: Fetching dependencies..."
+sleep $((RANDOM % 5 + 3))
+
+echo "Step 3/5: Compiling source..."
+sleep $((RANDOM % 10 + 5))
+
+echo "Step 4/5: Running tests..."
+sleep $((RANDOM % 5 + 2))
+
+echo "Step 5/5: Packaging artifacts..."
+sleep $((RANDOM % 5 + 2))
+
+echo ""
+echo "Build completed successfully at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "==================================="
+"""
+
+            job_body = client.V1Job(
+                metadata=client.V1ObjectMeta(
+                    name=name,
+                    namespace=namespace,
+                    labels={
+                        'app': 'build-simulator',
+                        'type': 'build-job',
+                        'deployment-test': 'true'
+                    }
+                ),
+                spec=client.V1JobSpec(
+                    # Run multiple build pods sequentially/in parallel
+                    completions=self.config.builds_per_ns,
+                    parallelism=self.config.build_parallelism,
+
+                    # Clean up finished pods after completion
+                    ttl_seconds_after_finished=300,
+
+                    # Timeout for the entire job
+                    active_deadline_seconds=self.config.build_timeout,
+
+                    # Don't retry failed builds (like real CI/CD)
+                    backoff_limit=0,
+
+                    template=client.V1PodTemplateSpec(
+                        metadata=client.V1ObjectMeta(
+                            labels={
+                                'app': 'build-simulator',
+                                'type': 'build-job',
+                                'job-name': name,
+                                'deployment-test': 'true'
+                            }
+                        ),
+                        spec=client.V1PodSpec(
+                            restart_policy="Never",
+
+                            # Security context (OpenShift requires non-root)
+                            security_context=client.V1PodSecurityContext(
+                                run_as_non_root=True,
+                                seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault")
+                            ),
+
+                            containers=[
+                                client.V1Container(
+                                    name="builder",
+                                    # Use UBI minimal for realistic build environment
+                                    image="registry.access.redhat.com/ubi9/ubi-minimal:latest",
+
+                                    command=["/bin/bash", "-c"],
+                                    args=[build_script],
+
+                                    env=[
+                                        client.V1EnvVar(name="JOB_NAME", value=name),
+                                        client.V1EnvVar(
+                                            name="NAMESPACE",
+                                            value_from=client.V1EnvVarSource(
+                                                field_ref=client.V1ObjectFieldSelector(
+                                                    field_path="metadata.namespace"
+                                                )
+                                            )
+                                        ),
+                                        client.V1EnvVar(
+                                            name="POD_NAME",
+                                            value_from=client.V1EnvVarSource(
+                                                field_ref=client.V1ObjectFieldSelector(
+                                                    field_path="metadata.name"
+                                                )
+                                            )
+                                        )
+                                    ],
+
+                                    resources=client.V1ResourceRequirements(
+                                        requests={"memory": "128Mi", "cpu": "100m"},
+                                        limits={"memory": "512Mi", "cpu": "500m"}
+                                    ),
+
+                                    security_context=client.V1SecurityContext(
+                                        allow_privilege_escalation=False,
+                                        capabilities=client.V1Capabilities(drop=["ALL"]),
+                                        run_as_non_root=True
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                )
+            )
+
+            await asyncio.to_thread(
+                batch_v1.create_namespaced_job,
+                namespace=namespace,
+                body=job_body
+            )
+
+            self.log_info(
+                f"Created build job {name} in {namespace} "
+                f"(completions: {self.config.builds_per_ns}, parallelism: {self.config.build_parallelism})",
+                "BUILD_JOB"
+            )
+            return True
+
+        except ApiException as e:
+            if e.status == 409:
+                return True
+            self.log_warn(f"Failed to create build job {name} in {namespace}: {e}", "BUILD_JOB")
+            return False
+
     async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 180) -> bool:
         """Wait for deployment pods to be ready"""
         deadline = time.time() + timeout
@@ -948,7 +1102,37 @@ go run /tmp/sim.go
             elif self.config.curl_test_enabled and not self.config.service_enabled:
                 self.log_warn(f"Curl test enabled but services disabled in {namespace_name} - skipping curl test pod", "CURL_TEST")
 
-            return {"success": success_count + statefulset_success, "errors": error_count + statefulset_errors}
+            # Create build jobs if enabled (simulates CI/CD workload)
+            build_job_success = 0
+            build_job_errors = 0
+            if self.config.build_job_enabled:
+                # Generate generic build job names (no customer information)
+                # Pattern: build-service-{component}-{version}
+                components = ['api', 'frontend', 'backend', 'worker', 'processor']
+
+                async def create_build_job_with_semaphore(job_name: str) -> bool:
+                    async with semaphore:
+                        return await self.create_build_job(namespace_name, job_name)
+
+                # Create multiple build jobs per namespace (like customer's CI/CD)
+                build_job_tasks = []
+                for i in range(self.config.statefulsets_per_ns):  # Reuse this count for number of concurrent builds
+                    component = components[i % len(components)]
+                    version = f"v{(namespace_idx % 5) + 1}.{(i % 10)}.0"
+                    job_name = f"build-service-{component}-{version.replace('.', '-')}"
+                    build_job_tasks.append(create_build_job_with_semaphore(job_name))
+
+                build_job_results = await asyncio.gather(*build_job_tasks, return_exceptions=True)
+                build_job_success = sum(1 for result in build_job_results if result is True)
+                build_job_errors = len(build_job_tasks) - build_job_success
+
+                self.log_info(
+                    f"Created {build_job_success}/{len(build_job_tasks)} build jobs in {namespace_name}",
+                    "BUILD_JOB"
+                )
+
+            return {"success": success_count + statefulset_success + build_job_success,
+                    "errors": error_count + statefulset_errors + build_job_errors}
 
     async def create_all_namespaces_and_deployments(self):
         """Create all namespaces and deployments"""
@@ -1094,6 +1278,13 @@ Environment Variables:
   STATEFULSET_REPLICAS (default: 3) - Number of replicas per StatefulSet
   STATEFULSETS_PER_NS (default: 1) - Number of StatefulSets per namespace
 
+  Build Job Simulation Configuration (CI/CD Pattern):
+  BUILD_JOB_ENABLED (default: false) - Enable/disable build job creation
+  BUILDS_PER_NS (default: 5) - Number of build completions per job
+  BUILD_PARALLELISM (default: 3) - Number of build pods running concurrently
+  BUILD_TIMEOUT (default: 600) - Job timeout in seconds
+  Note: Simulates CI/CD build workloads with short-lived pods
+
   SSL/TLS Configuration:
   K8S_VERIFY, OCP_API_VERIFY (default: auto-detect) - Set to 'true' to force SSL verification
   K8S_CA_CERT - Path to CA certificate file
@@ -1128,9 +1319,16 @@ Examples:
 
   # View OOM StatefulSet logs
   kubectl logs -f stateful-oom-1-0 -n deploy-test-1
+
+  # Build job simulation (disabled by default)
+  %(prog)s --build-job-enabled --builds-per-ns 10 --build-parallelism 5
+  BUILD_JOB_ENABLED=true BUILDS_PER_NS=10 %(prog)s
+
+  # View build job logs
+  kubectl logs -f build-service-api-v1-0-0-<pod-suffix> -n deploy-test-1
         """
     )
-    
+
     parser.add_argument('--total-namespaces', type=int,
                        help='Total number of namespaces to create')
     parser.add_argument('--namespace-parallel', type=int,
@@ -1177,6 +1375,18 @@ Examples:
                        help='Number of replicas per StatefulSet')
     parser.add_argument('--statefulsets-per-ns', type=int,
                        help='Number of StatefulSets per namespace')
+
+    # Build job configuration
+    parser.add_argument('--build-job-enabled', action='store_true', default=None,
+                       help='Enable build job creation (default: false)')
+    parser.add_argument('--no-build-job', action='store_true',
+                       help='Disable build job creation')
+    parser.add_argument('--builds-per-ns', type=int,
+                       help='Number of build completions per job')
+    parser.add_argument('--build-parallelism', type=int,
+                       help='Number of concurrent build pods')
+    parser.add_argument('--build-timeout', type=int,
+                       help='Build job timeout in seconds')
 
     return parser
 
@@ -1234,6 +1444,18 @@ async def main():
         config.statefulset_replicas = args.statefulset_replicas
     if args.statefulsets_per_ns is not None:
         config.statefulsets_per_ns = args.statefulsets_per_ns
+
+    # Build job configuration
+    if args.build_job_enabled is not None:
+        config.build_job_enabled = True
+    if args.no_build_job:
+        config.build_job_enabled = False
+    if args.builds_per_ns is not None:
+        config.builds_per_ns = args.builds_per_ns
+    if args.build_parallelism is not None:
+        config.build_parallelism = args.build_parallelism
+    if args.build_timeout is not None:
+        config.build_timeout = args.build_timeout
 
     tool = DeploymentTestTool(config)
     
