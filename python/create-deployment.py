@@ -39,7 +39,6 @@ class Colors:
     CYAN = '\033[0;36m'
     NC = '\033[0m'
 
-
 class Config:
     """Configuration class"""
     def __init__(self):
@@ -55,9 +54,19 @@ class Config:
         self.k8s_verify_ssl: Optional[bool] = self._get_verify_ssl_setting()
         self.kubeconfig_path: Optional[str] = os.getenv('KUBECONFIG')
         self.k8s_ca_cert_path: Optional[str] = None
-        self.curl_test_enabled = os.getenv('CURL_TEST_ENABLED', 'true').lower() == 'true'
-        self.curl_test_interval = int(os.getenv('CURL_TEST_INTERVAL', '30'))  # seconds between curls
-        self.curl_test_count = int(os.getenv('CURL_TEST_COUNT', '10'))  # number of curl attempts
+        
+        # NEW: Service creation control
+        self.service_enabled = os.getenv('SERVICE_ENABLED', 'false').lower() == 'true'
+
+        # Curl test configuration
+        self.curl_test_enabled = os.getenv('CURL_TEST_ENABLED', 'false').lower() == 'true'
+        self.curl_test_interval = int(os.getenv('CURL_TEST_INTERVAL', '30'))
+        self.curl_test_count = int(os.getenv('CURL_TEST_COUNT', '10'))
+
+        # StatefulSet OOM simulation configuration
+        self.statefulset_enabled = os.getenv('STATEFULSET_ENABLED', 'true').lower() == 'true'
+        self.statefulset_replicas = int(os.getenv('STATEFULSET_REPLICAS', '3'))
+        self.statefulsets_per_ns = int(os.getenv('STATEFULSETS_PER_NS', '1'))
     
     def _get_verify_ssl_setting(self) -> Optional[bool]:
         """Get SSL verification setting from environment"""
@@ -70,7 +79,6 @@ class Config:
                 if val_lower in ('false', '0', 'no'):
                     return False
         return None  # Not set, will auto-detect
-
 
 class DeploymentTestTool:
     """Simplified deployment testing tool"""
@@ -425,6 +433,41 @@ class DeploymentTestTool:
             self.log_warn(f"Failed to create Service {service_name} in {namespace}: {e}", "SERVICE")
             return False
 
+    async def create_headless_service(self, namespace: str, service_name: str, selector: Dict[str, str]) -> bool:
+        """Create a headless (ClusterIP: None) service for StatefulSet"""
+        try:
+            service_body = client.V1Service(
+                metadata=client.V1ObjectMeta(
+                    name=service_name,
+                    namespace=namespace,
+                    labels={'app': 'oom-simulator', 'deployment-test': 'true'}
+                ),
+                spec=client.V1ServiceSpec(
+                    cluster_ip="None",  # Headless service
+                    selector=selector,
+                    ports=[
+                        client.V1ServicePort(
+                            name="http",
+                            port=8080,
+                            protocol="TCP"
+                        )
+                    ]
+                )
+            )
+
+            await asyncio.to_thread(
+                self.core_v1.create_namespaced_service,
+                namespace=namespace,
+                body=service_body
+            )
+            self.log_info(f"Created headless service {service_name} in {namespace}", "SERVICE")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                return True
+            self.log_warn(f"Failed to create headless Service {service_name} in {namespace}: {e}", "SERVICE")
+            return False
+
     async def create_curl_test_pod(self, namespace: str, service_names: list) -> bool:
         """Create a pod that curls all services in the namespace and logs timing"""
         try:
@@ -529,109 +572,272 @@ tail -f /dev/null
             return False
 
     async def create_deployment(self, namespace: str, name: str) -> bool:
-        """Create deployment with 2 ConfigMaps and 2 Secrets mounted"""
+            """Create deployment with 2 ConfigMaps and 2 Secrets mounted"""
+            try:
+                # Create ConfigMaps and Secrets first
+                cm_names = [f"{name}-cm-{i}" for i in range(2)]
+                secret_names = [f"{name}-secret-{i}" for i in range(2)]
+                
+                # Create resources concurrently
+                resource_tasks = []
+                for cm_name in cm_names:
+                    resource_tasks.append(self.create_small_configmap(namespace, cm_name))
+                for secret_name in secret_names:
+                    resource_tasks.append(self.create_small_secret(namespace, secret_name))
+                
+                results = await asyncio.gather(*resource_tasks, return_exceptions=True)
+                if not all(r is True for r in results if not isinstance(r, Exception)):
+                    self.log_warn(f"Some resources failed for deployment {name}", "DEPLOYMENT")
+                
+                # Create volumes and volume mounts
+                volumes = []
+                volume_mounts = []
+                
+                # Mount 2 ConfigMaps
+                for i, cm_name in enumerate(cm_names):
+                    volume_name = f"cm-vol-{i}"
+                    volumes.append(client.V1Volume(
+                        name=volume_name,
+                        config_map=client.V1ConfigMapVolumeSource(name=cm_name)
+                    ))
+                    volume_mounts.append(client.V1VolumeMount(
+                        name=volume_name,
+                        mount_path=f"/config/cm-{i}"
+                    ))
+                
+                # Mount 2 Secrets
+                for i, secret_name in enumerate(secret_names):
+                    volume_name = f"secret-vol-{i}"
+                    volumes.append(client.V1Volume(
+                        name=volume_name,
+                        secret=client.V1SecretVolumeSource(secret_name=secret_name)
+                    ))
+                    volume_mounts.append(client.V1VolumeMount(
+                        name=volume_name,
+                        mount_path=f"/secrets/secret-{i}"
+                    ))
+                
+                # Create deployment
+                deployment_body = client.V1Deployment(
+                    metadata=client.V1ObjectMeta(
+                        name=name,
+                        namespace=namespace,
+                        labels={'app': name, 'deployment-test': 'true'}
+                    ),
+                    spec=client.V1DeploymentSpec(
+                        replicas=1,
+                        selector=client.V1LabelSelector(
+                            match_labels={'app': name}
+                        ),
+                        template=client.V1PodTemplateSpec(
+                            metadata=client.V1ObjectMeta(
+                                labels={'app': name, 'deployment-test': 'true'}
+                            ),
+                            spec=client.V1PodSpec(
+                                containers=[
+                                    client.V1Container(
+                                        name="nginx",
+                                        image="quay.io/openshift-psap-qe/nginx-alpine:multiarch",
+                                        ports=[client.V1ContainerPort(container_port=8080)],
+                                        volume_mounts=volume_mounts,
+                                        resources=client.V1ResourceRequirements(
+                                            # requests={"memory": "64Mi", "cpu": "50m"},
+                                            # limits={"memory": "128Mi", "cpu": "100m"}
+                                        )
+                                    )
+                                ],
+                                volumes=volumes
+                            )
+                        )
+                    )
+                )
+                
+                await asyncio.to_thread(
+                    self.apps_v1.create_namespaced_deployment,
+                    namespace=namespace,
+                    body=deployment_body
+                )
+                
+                # Wait for deployment to be ready
+                is_ready = await self.wait_for_deployment_ready(namespace, name)
+                
+                # MODIFIED: Create service only if enabled
+                if is_ready and self.config.service_enabled:
+                    service_created = await self.create_service(namespace, name)
+                    return is_ready and service_created
+                
+                return is_ready
+                
+            except ApiException as e:
+                if e.status == 409:
+                    return await self.wait_for_deployment_ready(namespace, name)
+                self.log_warn(f"Failed to create Deployment {name} in {namespace}: {e}", "DEPLOYMENT")
+                return False
+                
+    async def create_statefulset(self, namespace: str, name: str, replicas: int = 3) -> bool:
+        """Create StatefulSet with OOM simulation"""
         try:
-            # Create ConfigMaps and Secrets first
-            cm_names = [f"{name}-cm-{i}" for i in range(2)]
-            secret_names = [f"{name}-secret-{i}" for i in range(2)]
-            
-            # Create resources concurrently
-            resource_tasks = []
-            for cm_name in cm_names:
-                resource_tasks.append(self.create_small_configmap(namespace, cm_name))
-            for secret_name in secret_names:
-                resource_tasks.append(self.create_small_secret(namespace, secret_name))
-            
-            results = await asyncio.gather(*resource_tasks, return_exceptions=True)
-            if not all(r is True for r in results if not isinstance(r, Exception)):
-                self.log_warn(f"Some resources failed for deployment {name}", "DEPLOYMENT")
-            
-            # Create volumes and volume mounts
-            volumes = []
-            volume_mounts = []
-            
-            # Mount 2 ConfigMaps
-            for i, cm_name in enumerate(cm_names):
-                volume_name = f"cm-vol-{i}"
-                volumes.append(client.V1Volume(
-                    name=volume_name,
-                    config_map=client.V1ConfigMapVolumeSource(name=cm_name)
-                ))
-                volume_mounts.append(client.V1VolumeMount(
-                    name=volume_name,
-                    mount_path=f"/config/cm-{i}"
-                ))
-            
-            # Mount 2 Secrets
-            for i, secret_name in enumerate(secret_names):
-                volume_name = f"secret-vol-{i}"
-                volumes.append(client.V1Volume(
-                    name=volume_name,
-                    secret=client.V1SecretVolumeSource(secret_name=secret_name)
-                ))
-                volume_mounts.append(client.V1VolumeMount(
-                    name=volume_name,
-                    mount_path=f"/secrets/secret-{i}"
-                ))
-            
-            # Create deployment
-            deployment_body = client.V1Deployment(
+            # First, create the headless service required by StatefulSet
+            service_name = "oom-simulator"
+            selector = {
+                "app": "oom-simulator",
+                "scenario": "stateful-oom"
+            }
+
+            service_created = await self.create_headless_service(namespace, service_name, selector)
+            if not service_created:
+                self.log_warn(f"Failed to create headless service for StatefulSet {name}", "STATEFULSET")
+                return False
+
+            # Create StatefulSet with OOM simulation
+            statefulset_body = client.V1StatefulSet(
                 metadata=client.V1ObjectMeta(
                     name=name,
                     namespace=namespace,
-                    labels={'app': name, 'deployment-test': 'true'}
+                    labels={
+                        'app': 'oom-simulator',
+                        'scenario': 'stateful-oom',
+                        'type': 'statefulset',
+                        'deployment-test': 'true'
+                    }
                 ),
-                spec=client.V1DeploymentSpec(
-                    replicas=1,
+                spec=client.V1StatefulSetSpec(
+                    service_name=service_name,
+                    replicas=replicas,
                     selector=client.V1LabelSelector(
-                        match_labels={'app': name}
+                        match_labels=selector
                     ),
                     template=client.V1PodTemplateSpec(
                         metadata=client.V1ObjectMeta(
-                            labels={'app': name, 'deployment-test': 'true'}
+                            labels=selector
                         ),
                         spec=client.V1PodSpec(
+                            security_context=client.V1PodSecurityContext(
+                                run_as_non_root=True,
+                                seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault")
+                            ),
+                            restart_policy="Always",
                             containers=[
                                 client.V1Container(
-                                    name="nginx",
-                                    image="quay.io/openshift-psap-qe/nginx-alpine:multiarch",
-                                    ports=[client.V1ContainerPort(container_port=8080)],
-                                    volume_mounts=volume_mounts,
+                                    name="simulator",
+                                    image="registry.access.redhat.com/ubi9/go-toolset:latest",
                                     resources=client.V1ResourceRequirements(
-                                        # requests={"memory": "64Mi", "cpu": "50m"},
-                                        # limits={"memory": "128Mi", "cpu": "100m"}
-                                    )
+                                        requests={"memory": "48Mi", "cpu": "100m"},
+                                        limits={"memory": "64Mi", "cpu": "500m"}
+                                    ),
+                                    security_context=client.V1SecurityContext(
+                                        allow_privilege_escalation=False,
+                                        capabilities=client.V1Capabilities(
+                                            drop=["ALL"]
+                                        ),
+                                        run_as_non_root=True
+                                    ),
+                                    env=[
+                                        client.V1EnvVar(name="GOCACHE", value="/tmp/go-build-cache"),
+                                        client.V1EnvVar(name="GOMODCACHE", value="/tmp/go-mod-cache")
+                                    ],
+                                    command=["/bin/bash", "-c"],
+                                    args=["""cat > /tmp/sim.go <<'EOF'
+package main
+import ("fmt"; "time"; "os")
+func main() {
+  hostname, _ := os.Hostname()
+  fmt.Printf("=== StatefulSet OOM: Pod %s ===\\n", hostname)
+  fmt.Println("StatefulSet will recreate pod with SAME name after deletion")
+  var allocs [][]byte
+  for i := 0; i < 16; i++ {
+    chunk := make([]byte, 5*1024*1024)
+    for j := 0; j < len(chunk); j += 4096 { chunk[j] = byte(j) }
+    allocs = append(allocs, chunk)
+    fmt.Printf("Allocated: %d MB\\n", (i+1)*5)
+    time.Sleep(1 * time.Second)
+  }
+  select {}
+}
+EOF
+go run /tmp/sim.go
+"""]
                                 )
-                            ],
-                            volumes=volumes
+                            ]
                         )
                     )
                 )
             )
-            
+
             await asyncio.to_thread(
-                self.apps_v1.create_namespaced_deployment,
+                self.apps_v1.create_namespaced_stateful_set,
                 namespace=namespace,
-                body=deployment_body
+                body=statefulset_body
             )
-            
-            # Wait for deployment to be ready
-            is_ready = await self.wait_for_deployment_ready(namespace, name)
-            
-            # Create service for the deployment
-            if is_ready:
-                service_created = await self.create_service(namespace, name)
-                return is_ready and service_created
-            
-            return is_ready
-            
+
+            self.log_info(f"Created StatefulSet {name} with {replicas} replicas in {namespace}", "STATEFULSET")
+
+            # For OOM simulation, we just wait for pods to start (not be ready)
+            # since they will crash due to OOM by design
+            is_started = await self.wait_for_statefulset_pods_started(namespace, name)
+            return is_started
+
         except ApiException as e:
             if e.status == 409:
-                return await self.wait_for_deployment_ready(namespace, name)
-            self.log_warn(f"Failed to create Deployment {name} in {namespace}: {e}", "DEPLOYMENT")
+                return await self.wait_for_statefulset_pods_started(namespace, name)
+            self.log_warn(f"Failed to create StatefulSet {name} in {namespace}: {e}", "STATEFULSET")
             return False
 
-    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 300) -> bool:
+    async def wait_for_statefulset_pods_started(self, namespace: str, statefulset_name: str, timeout: int = 120) -> bool:
+        """Wait for StatefulSet pods to be created and started (not necessarily ready)
+
+        For OOM simulation, we don't wait for pods to be ready since they will
+        crash by design. We just verify that pods are being created.
+        """
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            try:
+                statefulset = await asyncio.to_thread(
+                    self.apps_v1.read_namespaced_stateful_set,
+                    name=statefulset_name,
+                    namespace=namespace
+                )
+
+                spec_replicas = statefulset.spec.replicas or 0
+
+                # Get all pods for this StatefulSet
+                pods = await asyncio.to_thread(
+                    self.core_v1.list_namespaced_pod,
+                    namespace=namespace,
+                    label_selector=f"app=oom-simulator,scenario=stateful-oom"
+                )
+
+                # Count pods that have been created (any phase)
+                created_pods = [
+                    pod for pod in pods.items
+                    if pod.status.phase in ["Pending", "Running", "Failed", "Unknown"]
+                ]
+
+                if len(created_pods) >= spec_replicas and spec_replicas > 0:
+                    self.log_info(
+                        f"StatefulSet {statefulset_name} pods started ({len(created_pods)}/{spec_replicas}). "
+                        f"Pods will OOM by design.",
+                        "STATEFULSET"
+                    )
+                    return True
+
+                await asyncio.sleep(2)
+
+            except ApiException as e:
+                if e.status == 404:
+                    await asyncio.sleep(2)
+                    continue
+                self.log_warn(f"Error checking StatefulSet {statefulset_name}: {e}", "STATEFULSET")
+                return False
+            except Exception as e:
+                self.log_warn(f"Unexpected error checking StatefulSet {statefulset_name}: {e}", "STATEFULSET")
+                return False
+
+        self.log_warn(f"Timeout waiting for StatefulSet {statefulset_name} pods to start", "STATEFULSET")
+        return False
+
+    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 180) -> bool:
         """Wait for deployment pods to be ready"""
         deadline = time.time() + timeout
         
@@ -683,45 +889,66 @@ tail -f /dev/null
         return False
 
     async def create_namespace_deployments(self, namespace_idx: int) -> Dict[str, int]:
-        """Create deployments for a single namespace"""
-        namespace_name = f"{self.config.namespace_prefix}-{namespace_idx}"
-        
-        # Create namespace
-        if not await self.ensure_namespace(namespace_name):
-            self.log_error(f"Failed to create namespace {namespace_name}", "NAMESPACE")
-            return {"success": 0, "errors": 1}
-        
-        # Create deployments
-        semaphore = asyncio.Semaphore(self.config.max_concurrent_operations)
-        
-        async def create_with_semaphore(name: str) -> bool:
-            async with semaphore:
-                return await self.create_deployment(namespace_name, name)
-        
-        tasks = [
-            create_with_semaphore(f"deploy-{i+1}") 
-            for i in range(self.config.deployments_per_ns)
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        success_count = sum(1 for result in results if result is True)
-        error_count = len(tasks) - success_count
-        
-        self.log_info(f"Created {success_count}/{len(tasks)} deployments in {namespace_name}", "DEPLOYMENT")
-        
-        # Create connectivity test pod if enabled and deployments succeeded
-        if self.config.curl_test_enabled and success_count > 0:
-            # Wait a bit longer to ensure services are fully ready
-            self.log_info(f"Waiting 10s before creating connectivity test pod in {namespace_name}", "CURL_TEST")
-            await asyncio.sleep(10)
+            """Create deployments for a single namespace"""
+            namespace_name = f"{self.config.namespace_prefix}-{namespace_idx}"
             
-            service_names = [f"deploy-{i+1}-svc" for i in range(self.config.deployments_per_ns)]
-            curl_pod_created = await self.create_curl_test_pod(namespace_name, service_names)
+            # Create namespace
+            if not await self.ensure_namespace(namespace_name):
+                self.log_error(f"Failed to create namespace {namespace_name}", "NAMESPACE")
+                return {"success": 0, "errors": 1}
             
-            if curl_pod_created:
-                self.log_info(f"Connectivity test pod created in {namespace_name}. Use: kubectl logs -f connectivity-test -n {namespace_name}", "CURL_TEST")
-        
-        return {"success": success_count, "errors": error_count}
+            # Create deployments
+            semaphore = asyncio.Semaphore(self.config.max_concurrent_operations)
+            
+            async def create_with_semaphore(name: str) -> bool:
+                async with semaphore:
+                    return await self.create_deployment(namespace_name, name)
+            
+            tasks = [
+                create_with_semaphore(f"deploy-{i+1}") 
+                for i in range(self.config.deployments_per_ns)
+            ]
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            success_count = sum(1 for result in results if result is True)
+            error_count = len(tasks) - success_count
+
+            self.log_info(f"Created {success_count}/{len(tasks)} deployments in {namespace_name}", "DEPLOYMENT")
+
+            # Create StatefulSets if enabled
+            statefulset_success = 0
+            statefulset_errors = 0
+            if self.config.statefulset_enabled:
+                async def create_statefulset_with_semaphore(name: str) -> bool:
+                    async with semaphore:
+                        return await self.create_statefulset(namespace_name, name, self.config.statefulset_replicas)
+
+                statefulset_tasks = [
+                    create_statefulset_with_semaphore(f"stateful-oom-{i+1}")
+                    for i in range(self.config.statefulsets_per_ns)
+                ]
+
+                statefulset_results = await asyncio.gather(*statefulset_tasks, return_exceptions=True)
+                statefulset_success = sum(1 for result in statefulset_results if result is True)
+                statefulset_errors = len(statefulset_tasks) - statefulset_success
+
+                self.log_info(f"Created {statefulset_success}/{len(statefulset_tasks)} StatefulSets in {namespace_name}", "STATEFULSET")
+
+            # MODIFIED: Create connectivity test pod only if both curl_test and services are enabled
+            if self.config.curl_test_enabled and self.config.service_enabled and success_count > 0:
+                # Wait a bit longer to ensure services are fully ready
+                self.log_info(f"Waiting 10s before creating connectivity test pod in {namespace_name}", "CURL_TEST")
+                await asyncio.sleep(10)
+
+                service_names = [f"deploy-{i+1}-svc" for i in range(self.config.deployments_per_ns)]
+                curl_pod_created = await self.create_curl_test_pod(namespace_name, service_names)
+
+                if curl_pod_created:
+                    self.log_info(f"Connectivity test pod created in {namespace_name}. Use: kubectl logs -f connectivity-test -n {namespace_name}", "CURL_TEST")
+            elif self.config.curl_test_enabled and not self.config.service_enabled:
+                self.log_warn(f"Curl test enabled but services disabled in {namespace_name} - skipping curl test pod", "CURL_TEST")
+
+            return {"success": success_count + statefulset_success, "errors": error_count + statefulset_errors}
 
     async def create_all_namespaces_and_deployments(self):
         """Create all namespaces and deployments"""
@@ -839,8 +1066,9 @@ Each namespace gets:
   - N deployments (default: 3)
   - Each deployment has 1 nginx pod
   - Each pod mounts 2 small ConfigMaps and 2 small Secrets
-  - Each deployment gets a ClusterIP service for HTTP access
-  - 1 connectivity test pod that curls all services and logs timing
+  - [Optional - Disabled by Default] Each deployment gets a ClusterIP service for HTTP access
+  - [Optional - Disabled by Default] 1 connectivity test pod that curls all services and logs timing
+  - [Enabled by Default] StatefulSets with OOM simulation for pod restart testing
 
 Environment Variables:
   TOTAL_NAMESPACES (default: 100)
@@ -852,11 +1080,20 @@ Environment Variables:
   LOG_FILE, LOG_LEVEL
   CLEANUP_ON_COMPLETION (default: false)
   
+  Service Configuration:
+  SERVICE_ENABLED (default: false) - Enable/disable service creation
+
   Connectivity Test Configuration:
-  CURL_TEST_ENABLED (default: true) - Enable/disable connectivity tests
+  CURL_TEST_ENABLED (default: false) - Enable/disable connectivity tests
   CURL_TEST_INTERVAL (default: 30) - Seconds between curl tests
   CURL_TEST_COUNT (default: 10) - Number of curl iterations per pod
-  
+  Note: Curl tests require services to be enabled
+
+  StatefulSet OOM Simulation Configuration:
+  STATEFULSET_ENABLED (default: true) - Enable/disable StatefulSet creation
+  STATEFULSET_REPLICAS (default: 3) - Number of replicas per StatefulSet
+  STATEFULSETS_PER_NS (default: 1) - Number of StatefulSets per namespace
+
   SSL/TLS Configuration:
   K8S_VERIFY, OCP_API_VERIFY (default: auto-detect) - Set to 'true' to force SSL verification
   K8S_CA_CERT - Path to CA certificate file
@@ -870,12 +1107,27 @@ Examples:
   %(prog)s --cleanup --namespace-parallel 20
   %(prog)s --verify-ssl  # Force SSL verification
   %(prog)s --curl-interval 60 --curl-count 5  # Custom curl test settings
-  
+
+  # Enable service creation (disabled by default)
+  %(prog)s --service-enabled
+  SERVICE_ENABLED=true %(prog)s
+
+  # Enable connectivity tests (disabled by default, requires services)
+  %(prog)s --service-enabled --curl-test-enabled
+  SERVICE_ENABLED=true CURL_TEST_ENABLED=true %(prog)s
+
+  # StatefulSet with OOM simulation (enabled by default)
+  %(prog)s --statefulset-replicas 5 --statefulsets-per-ns 2
+
+  # Disable StatefulSet creation
+  %(prog)s --no-statefulset
+  STATEFULSET_ENABLED=false %(prog)s
+
   # View connectivity test logs
   kubectl logs -f connectivity-test -n deploy-test-1
-  
-  # Disable connectivity tests
-  CURL_TEST_ENABLED=false %(prog)s
+
+  # View OOM StatefulSet logs
+  kubectl logs -f stateful-oom-1-0 -n deploy-test-1
         """
     )
     
@@ -899,17 +1151,34 @@ Examples:
                        help='Log file path')
     parser.add_argument('--verify-ssl', action='store_true',
                        help='Force SSL certificate verification')
+    
+    # Service configuration
+    parser.add_argument('--service-enabled', action='store_true', default=None,
+                       help='Enable service creation (default: false)')
+    parser.add_argument('--no-service', action='store_true',
+                       help='Disable service creation')
+
+    # Curl test configuration
     parser.add_argument('--curl-test-enabled', action='store_true', default=None,
-                       help='Enable connectivity tests (default: true)')
+                       help='Enable connectivity tests (default: false)')
     parser.add_argument('--no-curl-test', action='store_true',
                        help='Disable connectivity tests')
     parser.add_argument('--curl-interval', type=int,
                        help='Seconds between curl tests')
     parser.add_argument('--curl-count', type=int,
                        help='Number of curl test iterations')
-    
-    return parser
 
+    # StatefulSet OOM simulation configuration
+    parser.add_argument('--statefulset-enabled', action='store_true', default=None,
+                       help='Enable StatefulSet creation with OOM simulation (default: true)')
+    parser.add_argument('--no-statefulset', action='store_true',
+                       help='Disable StatefulSet creation')
+    parser.add_argument('--statefulset-replicas', type=int,
+                       help='Number of replicas per StatefulSet')
+    parser.add_argument('--statefulsets-per-ns', type=int,
+                       help='Number of StatefulSets per namespace')
+
+    return parser
 
 async def main():
     """Main execution function"""
@@ -939,6 +1208,14 @@ async def main():
         config.log_file = args.log_file
     if args.verify_ssl:
         config.k8s_verify_ssl = True
+    
+    # Service configuration
+    if args.service_enabled is not None:
+        config.service_enabled = True
+    if args.no_service:
+        config.service_enabled = False
+    
+    # Curl test configuration
     if args.curl_test_enabled is not None:
         config.curl_test_enabled = True
     if args.no_curl_test:
@@ -947,7 +1224,17 @@ async def main():
         config.curl_test_interval = args.curl_interval
     if args.curl_count is not None:
         config.curl_test_count = args.curl_count
-    
+
+    # StatefulSet configuration
+    if args.statefulset_enabled is not None:
+        config.statefulset_enabled = True
+    if args.no_statefulset:
+        config.statefulset_enabled = False
+    if args.statefulset_replicas is not None:
+        config.statefulset_replicas = args.statefulset_replicas
+    if args.statefulsets_per_ns is not None:
+        config.statefulsets_per_ns = args.statefulsets_per_ns
+
     tool = DeploymentTestTool(config)
     
     try:
@@ -958,7 +1245,6 @@ async def main():
     except Exception as e:
         tool.log_error(f"Test failed: {e}", "MAIN")
         sys.exit(1)
-
 
 if __name__ == '__main__':
     asyncio.run(main())
