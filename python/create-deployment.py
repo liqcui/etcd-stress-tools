@@ -71,7 +71,7 @@ class Config:
         # Build job configuration (based on must-gather analysis)
         # Observed pattern: 20+ builds per namespace, 3-5 concurrent
         self.build_job_enabled = os.getenv('BUILD_JOB_ENABLED', 'true').lower() == 'true'
-        self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '5'))  # Completions per job
+        self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '3'))  # Completions per job
         self.build_parallelism = int(os.getenv('BUILD_PARALLELISM', '3'))  # Concurrent pods
         self.build_timeout = int(os.getenv('BUILD_TIMEOUT', '900'))  # 15 minutes (realistic)
     

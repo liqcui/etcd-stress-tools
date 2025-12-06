@@ -91,7 +91,7 @@ func NewDeploymentConfig() *DeploymentConfig {
 		StatefulSetReplicas:     getEnvInt("STATEFULSET_REPLICAS", 3),
 		StatefulSetsPerNS:       getEnvInt("STATEFULSETS_PER_NS", 1),
 		BuildJobEnabled:         getEnvBool("BUILD_JOB_ENABLED", true),
-		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 5),
+		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 3),
 		BuildParallelism:        getEnvInt("BUILD_PARALLELISM", 3),
 		BuildTimeout:            getEnvInt("BUILD_TIMEOUT", 900),
 		CurlTestEnabled:         getEnvBool("CURL_TEST_ENABLED", false),
