@@ -160,8 +160,8 @@ func (d *DeploymentTool) setupKubernetesClient() error {
 	}
 
 	// Set client configuration
-	config.QPS = 50.0
-	config.Burst = 100
+	config.QPS = 100.0
+	config.Burst = 200
 	config.Timeout = 60 * time.Second
 
 	d.clientset, err = kubernetes.NewForConfig(config)
