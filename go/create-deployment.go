@@ -54,10 +54,10 @@ type DeploymentConfig struct {
 	StatefulSetsPerNS   int
 
 	// Build job settings (CI/CD simulation)
-	BuildJobEnabled    bool
-	BuildsPerNS        int     // Completions per job
-	BuildParallelism   int     // Concurrent pods
-	BuildTimeout       int     // Job timeout in seconds
+	BuildJobEnabled  bool
+	BuildsPerNS      int // Completions per job
+	BuildParallelism int // Concurrent pods
+	BuildTimeout     int // Job timeout in seconds
 
 	// Curl test settings
 	CurlTestEnabled  bool
@@ -91,7 +91,7 @@ func NewDeploymentConfig() *DeploymentConfig {
 		StatefulSetReplicas:     getEnvInt("STATEFULSET_REPLICAS", 3),
 		StatefulSetsPerNS:       getEnvInt("STATEFULSETS_PER_NS", 1),
 		BuildJobEnabled:         getEnvBool("BUILD_JOB_ENABLED", true),
-		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 10),
+		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 5),
 		BuildParallelism:        getEnvInt("BUILD_PARALLELISM", 3),
 		BuildTimeout:            getEnvInt("BUILD_TIMEOUT", 900),
 		CurlTestEnabled:         getEnvBool("CURL_TEST_ENABLED", false),
@@ -452,7 +452,7 @@ func (d *DeploymentTool) createDeployment(ctx context.Context, namespace, name s
 	}
 
 	// Wait for deployment to be ready
-	if err := d.waitForDeploymentReady(ctx, namespace, name, 180*time.Second); err != nil {
+	if err := d.waitForDeploymentReady(ctx, namespace, name, 300*time.Second); err != nil {
 		d.logWarn(fmt.Sprintf("Deployment %s pods not ready: %v", name, err), "DEPLOYMENT")
 	}
 
@@ -913,7 +913,7 @@ func (d *DeploymentTool) createBuildJobsForNamespace(ctx context.Context, namesp
 
 	// Create 20 build jobs per namespace (matches must-gather observation)
 	numBuilds := min(len(components), 20)
-	
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	semaphore := make(chan struct{}, d.config.MaxConcurrentOperations)

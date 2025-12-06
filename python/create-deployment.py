@@ -64,14 +64,14 @@ class Config:
         self.curl_test_count = int(os.getenv('CURL_TEST_COUNT', '10'))
 
         # StatefulSet OOM simulation configuration
-        self.statefulset_enabled = os.getenv('STATEFULSET_ENABLED', 'true').lower() == 'true'
+        self.statefulset_enabled = os.getenv('STATEFULSET_ENABLED', 'false').lower() == 'true'
         self.statefulset_replicas = int(os.getenv('STATEFULSET_REPLICAS', '3'))
         self.statefulsets_per_ns = int(os.getenv('STATEFULSETS_PER_NS', '1'))
 
         # Build job configuration (based on must-gather analysis)
         # Observed pattern: 20+ builds per namespace, 3-5 concurrent
-        self.build_job_enabled = os.getenv('BUILD_JOB_ENABLED', 'false').lower() == 'true'
-        self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '10'))  # Completions per job
+        self.build_job_enabled = os.getenv('BUILD_JOB_ENABLED', 'true').lower() == 'true'
+        self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '5'))  # Completions per job
         self.build_parallelism = int(os.getenv('BUILD_PARALLELISM', '3'))  # Concurrent pods
         self.build_timeout = int(os.getenv('BUILD_TIMEOUT', '900'))  # 15 minutes (realistic)
     
@@ -1086,7 +1086,7 @@ echo "================================================================"
             self.log_warn(f"Failed to create build job {name} in {namespace}: {e}", "BUILD_JOB")
             return False
 
-    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 180) -> bool:
+    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 300) -> bool:
         """Wait for deployment pods to be ready"""
         deadline = time.time() + timeout
         
@@ -1397,12 +1397,12 @@ Environment Variables:
   Note: Curl tests require services to be enabled
 
   StatefulSet OOM Simulation Configuration:
-  STATEFULSET_ENABLED (default: true) - Enable/disable StatefulSet creation
+  STATEFULSET_ENABLED (default: false) - Enable/disable StatefulSet creation
   STATEFULSET_REPLICAS (default: 3) - Number of replicas per StatefulSet
   STATEFULSETS_PER_NS (default: 1) - Number of StatefulSets per namespace
 
   Build Job Simulation Configuration (Based on Must-Gather Analysis):
-  BUILD_JOB_ENABLED (default: false) - Enable/disable build job creation
+  BUILD_JOB_ENABLED (default: true) - Enable/disable build job creation
   BUILDS_PER_NS (default: 10) - Number of build completions per job
   BUILD_PARALLELISM (default: 3) - Number of build pods running concurrently
   BUILD_TIMEOUT (default: 900) - Job timeout in seconds (15 minutes)
@@ -1415,8 +1415,8 @@ Environment Variables:
   - Process overhead: 60-85 processes per build pod (matches must-gather)
   - Build duration: 1-5 minutes (randomized, realistic)
   - Staggered start times to prevent simultaneous launches
-  - Resource requests: 256Mi RAM, 200m CPU (realistic for JEE builds)
-  - Resource limits: 768Mi RAM, 1000m CPU (allows burst during compilation)
+  - Resource requests: 64Mi RAM, 50m CPU (reduced for resource-constrained testing)
+  - Resource limits: 256Mi RAM, 500m CPU (reduced for testing environments)
   - Automatic cleanup after 5 minutes (TTL)
   - Job naming pattern: build-{service}-{component}-{version}-s-1
 
@@ -1442,22 +1442,19 @@ Examples:
   %(prog)s --service-enabled --curl-test-enabled
   SERVICE_ENABLED=true CURL_TEST_ENABLED=true %(prog)s
 
-  # StatefulSet with OOM simulation (enabled by default)
-  %(prog)s --statefulset-replicas 5 --statefulsets-per-ns 2
+  # StatefulSet with OOM simulation (disabled by default)
+  %(prog)s --statefulset-enabled --statefulset-replicas 5 --statefulsets-per-ns 2
+  STATEFULSET_ENABLED=true %(prog)s
 
-  # Disable StatefulSet creation
-  %(prog)s --no-statefulset
-  STATEFULSET_ENABLED=false %(prog)s
-
-  # View connectivity test logs
-  kubectl logs -f connectivity-test -n deploy-test-1
-
-  # View OOM StatefulSet logs
+  # View OOM StatefulSet logs (if enabled)
   kubectl logs -f stateful-oom-1-0 -n deploy-test-1
 
-  # Build job simulation (disabled by default)
-  %(prog)s --build-job-enabled --builds-per-ns 10 --build-parallelism 5
-  BUILD_JOB_ENABLED=true BUILDS_PER_NS=10 %(prog)s
+  # Build job simulation (enabled by default)
+  %(prog)s --builds-per-ns 10 --build-parallelism 5
+
+  # Disable build job creation
+  %(prog)s --no-build-job
+  BUILD_JOB_ENABLED=false %(prog)s
 
   # View build job logs
   kubectl logs -f build-service-api-v1-0-0-<pod-suffix> -n deploy-test-1

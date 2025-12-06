@@ -1,0 +1,199 @@
+===============================================================================
+CREATE-DEPLOYMENT TOOL - QUICK REFERENCE
+===============================================================================
+
+LOCATION:
+  Python: etcd-stress-tools/python/create-deployment.py
+  Go:     etcd-stress-tools/go/create-deployment
+
+===============================================================================
+DEFAULT BEHAVIOR (No flags or env vars)
+===============================================================================
+
+python3 create-deployment.py --total-namespaces 5
+# or
+./create-deployment --total-namespaces 5
+
+Creates per namespace:
+  ✅ 3 nginx deployments
+  ✅ 20 build jobs (realistic CI/CD simulation)
+  ❌ No StatefulSets
+  ❌ No Services
+
+===============================================================================
+KEY DEFAULTS (Both Python and Go)
+===============================================================================
+
+BUILD_JOB_ENABLED        = true   (✅ Enabled by default)
+STATEFULSET_ENABLED      = false  (❌ Disabled by default)
+SERVICE_ENABLED          = false  (❌ Disabled by default)
+CURL_TEST_ENABLED        = false  (❌ Disabled by default)
+
+TOTAL_NAMESPACES         = 100
+NAMESPACE_PARALLEL       = 10
+DEPLOYMENTS_PER_NS       = 3
+
+BUILDS_PER_NS            = 10     (completions per job)
+BUILD_PARALLELISM        = 3      (concurrent build pods)
+BUILD_TIMEOUT            = 900    (15 minutes)
+
+STATEFULSET_REPLICAS     = 3
+STATEFULSETS_PER_NS      = 1
+
+===============================================================================
+BUILD JOB CONFIGURATION
+===============================================================================
+
+Resources per build pod:
+  Request: 64Mi RAM, 50m CPU
+  Limit:   256Mi RAM, 500m CPU
+
+Build features:
+  - 20 unique jobs per namespace
+  - 7-phase realistic build pipeline
+  - Creates 60-85 processes per pod
+  - Staggered creation (1s delay)
+  - Auto-cleanup after 5 minutes (TTL)
+
+===============================================================================
+RUNNING THE TOOL
+===============================================================================
+
+Python (works everywhere):
+  python3 create-deployment.py --total-namespaces 5
+
+Go on Linux:
+  ./create-deployment --total-namespaces 5
+
+Go on macOS (code signing issue workaround):
+  go run create-deployment.go --total-namespaces 5
+  # or use wrapper script:
+  ./run-create-deployment.sh --total-namespaces 5
+
+See go/MACOS_BINARY_FIX.md for macOS binary execution issues.
+
+===============================================================================
+COMMON USAGE PATTERNS
+===============================================================================
+
+1. Quick Test (2 namespaces):
+   go run create-deployment.go --total-namespaces 2
+   # or: python3 create-deployment.py --total-namespaces 2
+
+2. Disable Build Jobs:
+   BUILD_JOB_ENABLED=false ./create-deployment --total-namespaces 5
+
+3. Enable StatefulSets:
+   STATEFULSET_ENABLED=true ./create-deployment --total-namespaces 3
+
+4. Custom Build Parallelism:
+   BUILD_PARALLELISM=5 ./create-deployment --total-namespaces 5
+
+5. Everything Enabled:
+   STATEFULSET_ENABLED=true SERVICE_ENABLED=true \
+     ./create-deployment --total-namespaces 5
+
+6. Minimal Resources (No build jobs):
+   BUILD_JOB_ENABLED=false \
+     ./create-deployment --total-namespaces 10 --deployments-per-ns 1
+
+7. With Cleanup:
+   ./create-deployment --total-namespaces 5 --cleanup
+
+===============================================================================
+MONITORING COMMANDS
+===============================================================================
+
+Watch build jobs:
+  kubectl get jobs -A -l type=build-job -w
+
+Watch build pods:
+  kubectl get pods -A -l type=build-job -w
+
+View build pod logs:
+  kubectl logs -f <build-pod> -n <namespace>
+
+Count processes in build pod:
+  kubectl exec <build-pod> -n <namespace> -- ps aux | wc -l
+
+Check resource usage:
+  kubectl top pods -A -l type=build-job
+
+List all test namespaces:
+  kubectl get ns -l deployment-test=true
+
+===============================================================================
+CLEANUP COMMANDS
+===============================================================================
+
+Delete all test resources:
+  kubectl delete ns -l deployment-test=true
+
+Delete build jobs only:
+  kubectl delete jobs -A -l type=build-job
+
+Delete specific namespace:
+  kubectl delete ns deploy-test-1
+
+===============================================================================
+RESOURCE ESTIMATES
+===============================================================================
+
+10 namespaces with defaults:
+  Deployments: 30 pods (~300Mi RAM, ~300m CPU)
+  Build Jobs:  200 jobs, max 30 concurrent pods (~2-8GB RAM, ~1.5-15 CPU)
+  Total:       ~3-10GB RAM, ~2-16 CPU cores (bursty)
+
+5 namespaces with BUILD_PARALLELISM=5:
+  Deployments: 15 pods
+  Build Jobs:  100 jobs, max 25 concurrent pods (~1.6-6.25GB RAM)
+  Total:       ~2-7GB RAM, ~1-12 CPU cores (bursty)
+
+===============================================================================
+TROUBLESHOOTING
+===============================================================================
+
+Build pods not starting:
+  - Check node resources: kubectl top nodes
+  - Check resource quotas: kubectl get resourcequotas -A
+  - Lower BUILD_PARALLELISM or TOTAL_NAMESPACES
+
+Build pods failing:
+  - View logs: kubectl logs <build-pod> -n <namespace>
+  - Check for OOMKilled: kubectl describe pod <build-pod> -n <namespace>
+  - Increase memory limits in code if needed
+
+Too much load:
+  - Reduce BUILD_PARALLELISM (try 2-3)
+  - Reduce TOTAL_NAMESPACES (try 2-5)
+  - Set BUILD_JOB_ENABLED=false
+
+===============================================================================
+FILES LOCATION
+===============================================================================
+
+Python:
+  Code:    etcd-stress-tools/python/create-deployment.py
+  Docs:    etcd-stress-tools/python/BUILD_JOB_*.md
+
+Go:
+  Code:    etcd-stress-tools/go/create-deployment.go
+  Binary:  etcd-stress-tools/go/create-deployment
+  Docs:    etcd-stress-tools/go/GO_CONVERSION_SUMMARY.md
+
+General:
+  Resource changes:  etcd-stress-tools/RESOURCE_REDUCTION.md
+  Default changes:   etcd-stress-tools/DEFAULT_VALUES_UPDATE.md
+  Quick reference:   etcd-stress-tools/QUICK_REFERENCE.txt
+
+===============================================================================
+HELP COMMANDS
+===============================================================================
+
+Python:
+  python3 create-deployment.py --help
+
+Go:
+  ./create-deployment --help
+
+===============================================================================
