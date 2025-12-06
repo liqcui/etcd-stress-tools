@@ -1086,7 +1086,7 @@ echo "================================================================"
             self.log_warn(f"Failed to create build job {name} in {namespace}: {e}", "BUILD_JOB")
             return False
 
-    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 300) -> bool:
+    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 180) -> bool:
         """Wait for deployment pods to be ready"""
         deadline = time.time() + timeout
         
