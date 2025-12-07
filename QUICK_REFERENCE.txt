@@ -33,9 +33,9 @@ TOTAL_NAMESPACES         = 100
 NAMESPACE_PARALLEL       = 10
 DEPLOYMENTS_PER_NS       = 3
 
-BUILDS_PER_NS            = 10     (completions per job)
-BUILD_PARALLELISM        = 3      (concurrent build pods)
-BUILD_TIMEOUT            = 900    (15 minutes)
+BUILDS_PER_NS            = 20     (completions per job)
+BUILD_PARALLELISM        = 10     (concurrent build pods)
+BUILD_TIMEOUT            = 300    (5 minutes)
 
 STATEFULSET_REPLICAS     = 3
 STATEFULSETS_PER_NS      = 1
@@ -50,10 +50,11 @@ Resources per build pod:
 
 Build features:
   - 20 unique jobs per namespace
-  - 7-phase realistic build pipeline
-  - Creates 60-85 processes per pod
-  - Staggered creation (1s delay)
+  - Lightweight build script (~15 seconds)
+  - Creates 10-15 processes per pod (optimized for rapid pod creation)
+  - NO stagger delay (immediate creation)
   - Auto-cleanup after 5 minutes (TTL)
+  - Strategy: Many pods quickly > Few pods with many processes
 
 ===============================================================================
 RUNNING THE TOOL
@@ -139,15 +140,17 @@ Delete specific namespace:
 RESOURCE ESTIMATES
 ===============================================================================
 
-10 namespaces with defaults:
+10 namespaces with NEW defaults:
   Deployments: 30 pods (~300Mi RAM, ~300m CPU)
-  Build Jobs:  200 jobs, max 30 concurrent pods (~2-8GB RAM, ~1.5-15 CPU)
-  Total:       ~3-10GB RAM, ~2-16 CPU cores (bursty)
+  Build Jobs:  200 jobs (20 per namespace), max 100 concurrent pods
+  Build Pods:  Each pod: 10-15 processes, ~15 second duration
+  Total:       ~7-26GB RAM, ~5-50 CPU cores (bursty, scales with parallelism)
 
-5 namespaces with BUILD_PARALLELISM=5:
+5 namespaces with NEW defaults:
   Deployments: 15 pods
-  Build Jobs:  100 jobs, max 25 concurrent pods (~1.6-6.25GB RAM)
-  Total:       ~2-7GB RAM, ~1-12 CPU cores (bursty)
+  Build Jobs:  100 jobs (20 per namespace), max 50 concurrent pods
+  Build Pods:  Each pod completes in ~15 seconds
+  Total:       ~4-13GB RAM, ~2.5-25 CPU cores (bursty)
 
 ===============================================================================
 TROUBLESHOOTING

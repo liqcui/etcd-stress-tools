@@ -91,9 +91,9 @@ func NewDeploymentConfig() *DeploymentConfig {
 		StatefulSetReplicas:     getEnvInt("STATEFULSET_REPLICAS", 3),
 		StatefulSetsPerNS:       getEnvInt("STATEFULSETS_PER_NS", 1),
 		BuildJobEnabled:         getEnvBool("BUILD_JOB_ENABLED", true),
-		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 3),
-		BuildParallelism:        getEnvInt("BUILD_PARALLELISM", 3),
-		BuildTimeout:            getEnvInt("BUILD_TIMEOUT", 900),
+		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 20),
+		BuildParallelism:        getEnvInt("BUILD_PARALLELISM", 10),
+		BuildTimeout:            getEnvInt("BUILD_TIMEOUT", 300),
 		CurlTestEnabled:         getEnvBool("CURL_TEST_ENABLED", false),
 		CurlTestInterval:        getEnvInt("CURL_TEST_INTERVAL", 30),
 		CurlTestCount:           getEnvInt("CURL_TEST_COUNT", 10),
@@ -643,83 +643,57 @@ go run /tmp/sim.go`
 
 // createBuildJob creates a Job that simulates CI/CD build workload
 func (d *DeploymentTool) createBuildJob(ctx context.Context, namespace, name string) error {
-	// AGGRESSIVE build script to trigger "resource temporarily unavailable" ASAP
-	// Creates maximum processes in minimum time to exhaust system resources
+	// FAST POD CREATION build script to trigger "resource temporarily unavailable" ASAP
+	// Strategy: Create MANY pods quickly with FEWER processes per pod
+	// This exhausts cluster resources (pod scheduling, CNI, kubelet) faster than per-pod processes
 	buildScript := `#!/bin/bash
 set -e
 
 echo "================================================================"
-echo "AGGRESSIVE Build Job: ${JOB_NAME}"
+echo "FAST BUILD Job: ${JOB_NAME}"
 echo "Started at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Namespace: ${NAMESPACE}"
 echo "Pod: ${POD_NAME}"
-echo "Target: Create 100+ processes in <10 seconds"
+echo "Strategy: Quick completion to trigger next pod ASAP"
 echo "================================================================"
 
-# AGGRESSIVE: Create many processes simultaneously without delay
-# This simulates the resource exhaustion pattern from must-gather
-aggressive_process_spawn() {
-    local num_processes=$1
-    local task_name=$2
-    echo "[$(date -u +%H:%M:%S)] ${task_name} - Spawning ${num_processes} processes..."
+# Lightweight process spawn - just enough to simulate build activity
+# Goal: Complete quickly so next pod starts immediately
+lightweight_build() {
+    echo "[$(date -u +%H:%M:%S)] Starting lightweight build simulation..."
 
-    # Spawn all processes at once (no sleep between iterations)
-    for i in $(seq 1 $num_processes); do
-        # Multiple background processes per iteration
-        (dd if=/dev/zero of=/dev/null bs=1M count=5 2>/dev/null) &
-        (echo "Worker $i" | md5sum > /dev/null) &
-        (sleep 60) &  # Keep process alive
-        (cat /dev/null) &
-        (true) &
+    # Create minimal background processes (10-15 total instead of 300+)
+    for i in $(seq 1 5); do
+        (sleep 15 && echo "Worker $i done") &
     done
 
-    echo "[$(date -u +%H:%M:%S)] ${task_name} - Spawned ${num_processes} process groups"
+    # Simulate build phases with minimal overhead
+    echo "[$(date -u +%H:%M:%S)] Phase 1: Dependencies (lightweight)"
+    sleep 1
+
+    echo "[$(date -u +%H:%M:%S)] Phase 2: Compilation (lightweight)"
+    sleep 1
+
+    echo "[$(date -u +%H:%M:%S)] Phase 3: Testing (lightweight)"
+    sleep 1
+
+    echo "[$(date -u +%H:%M:%S)] Build phases complete"
 }
 
-# PHASE 1: Immediate process explosion (0-2 seconds)
-echo ""
-echo "=== Phase 1: Rapid Process Creation ==="
-# Create 30 process groups immediately (30 × 5 = 150 processes)
-aggressive_process_spawn 30 "Initial process burst"
-echo "✓ Phase 1 complete"
+# Execute lightweight build
+lightweight_build
 
-# PHASE 2: Additional load (2-4 seconds)
-echo ""
-echo "=== Phase 2: Additional Process Load ==="
-# Create another 20 process groups (20 × 5 = 100 processes)
-aggressive_process_spawn 20 "Secondary process burst"
-echo "✓ Phase 2 complete"
-
-# PHASE 3: Sustained load (4-6 seconds)
-echo ""
-echo "=== Phase 3: Sustained Process Pressure ==="
-# Create final 15 process groups (15 × 5 = 75 processes)
-aggressive_process_spawn 15 "Final process burst"
-echo "✓ Phase 3 complete"
-
-# Total: ~325 background processes created in <5 seconds
-# This should trigger fork/exec failures and CNI timeout issues
-
-# Show process count
-echo ""
-echo "================================================================"
-echo "Process count: $(ps aux | wc -l)"
-echo "================================================================"
-
-# Keep processes alive for a short time to maintain pressure
-echo "Maintaining process pressure for 30 seconds..."
-sleep 30
-
-# Wait for background jobs to complete
-echo "Cleaning up background processes..."
+# Wait for background jobs (total ~15 seconds)
+echo "Waiting for background tasks..."
 wait 2>/dev/null || true
 
 echo ""
 echo "================================================================"
-echo "BUILD COMPLETE (AGGRESSIVE MODE)"
+echo "BUILD COMPLETE (FAST POD MODE)"
 echo "================================================================"
-echo "Duration: ~30-40 seconds"
-echo "Processes created: 300+"
+echo "Duration: ~15 seconds (optimized for rapid pod creation)"
+echo "Processes: 10-15 (minimal per-pod overhead)"
+echo "Strategy: Many pods quickly > Few pods with many processes"
 echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "================================================================"`
 
@@ -940,10 +914,8 @@ func (d *DeploymentTool) createBuildJobsForNamespace(ctx context.Context, namesp
 				mu.Unlock()
 			}
 
-			// Stagger build creation (matches Python implementation)
-			if index > 0 && index%d.config.BuildParallelism == 0 {
-				time.Sleep(1 * time.Second)
-			}
+			// NO DELAY - Create all build jobs as fast as possible
+			// This maximizes pod creation rate to trigger resource exhaustion ASAP
 		}(i)
 	}
 

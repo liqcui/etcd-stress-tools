@@ -68,12 +68,13 @@ class Config:
         self.statefulset_replicas = int(os.getenv('STATEFULSET_REPLICAS', '3'))
         self.statefulsets_per_ns = int(os.getenv('STATEFULSETS_PER_NS', '1'))
 
-        # Build job configuration (based on must-gather analysis)
-        # Observed pattern: 20+ builds per namespace, 3-5 concurrent
+        # Build job configuration (optimized for rapid pod creation)
+        # Strategy: Many lightweight pods > Few heavy pods
+        # This exhausts cluster resources (scheduling, CNI, kubelet) faster
         self.build_job_enabled = os.getenv('BUILD_JOB_ENABLED', 'true').lower() == 'true'
-        self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '3'))  # Completions per job
-        self.build_parallelism = int(os.getenv('BUILD_PARALLELISM', '3'))  # Concurrent pods
-        self.build_timeout = int(os.getenv('BUILD_TIMEOUT', '900'))  # 15 minutes (realistic)
+        self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '20'))  # More completions = more pods
+        self.build_parallelism = int(os.getenv('BUILD_PARALLELISM', '10'))  # Higher parallelism = faster creation
+        self.build_timeout = int(os.getenv('BUILD_TIMEOUT', '300'))  # 5 minutes (faster timeout)
     
     def _get_verify_ssl_setting(self) -> Optional[bool]:
         """Get SSL verification setting from environment"""
@@ -860,83 +861,57 @@ go run /tmp/sim.go
             # Use batch API for Jobs
             batch_v1 = client.BatchV1Api(self.core_v1.api_client)
 
-            # AGGRESSIVE build script to trigger "resource temporarily unavailable" ASAP
-            # Creates maximum processes in minimum time to exhaust system resources
+            # FAST POD CREATION build script to trigger "resource temporarily unavailable" ASAP
+            # Strategy: Create MANY pods quickly with FEWER processes per pod
+            # This exhausts cluster resources (pod scheduling, CNI, kubelet) faster than per-pod processes
             build_script = """#!/bin/bash
 set -e
 
 echo "================================================================"
-echo "AGGRESSIVE Build Job: ${JOB_NAME}"
+echo "FAST BUILD Job: ${JOB_NAME}"
 echo "Started at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Namespace: ${NAMESPACE}"
 echo "Pod: ${POD_NAME}"
-echo "Target: Create 100+ processes in <10 seconds"
+echo "Strategy: Quick completion to trigger next pod ASAP"
 echo "================================================================"
 
-# AGGRESSIVE: Create many processes simultaneously without delay
-# This simulates the resource exhaustion pattern from must-gather
-aggressive_process_spawn() {
-    local num_processes=$1
-    local task_name=$2
-    echo "[$(date -u +%H:%M:%S)] ${task_name} - Spawning ${num_processes} processes..."
+# Lightweight process spawn - just enough to simulate build activity
+# Goal: Complete quickly so next pod starts immediately
+lightweight_build() {
+    echo "[$(date -u +%H:%M:%S)] Starting lightweight build simulation..."
 
-    # Spawn all processes at once (no sleep between iterations)
-    for i in $(seq 1 $num_processes); do
-        # Multiple background processes per iteration
-        (dd if=/dev/zero of=/dev/null bs=1M count=5 2>/dev/null) &
-        (echo "Worker $i" | md5sum > /dev/null) &
-        (sleep 60) &  # Keep process alive
-        (cat /dev/null) &
-        (true) &
+    # Create minimal background processes (10-15 total instead of 300+)
+    for i in $(seq 1 5); do
+        (sleep 15 && echo "Worker $i done") &
     done
 
-    echo "[$(date -u +%H:%M:%S)] ${task_name} - Spawned ${num_processes} process groups"
+    # Simulate build phases with minimal overhead
+    echo "[$(date -u +%H:%M:%S)] Phase 1: Dependencies (lightweight)"
+    sleep 1
+
+    echo "[$(date -u +%H:%M:%S)] Phase 2: Compilation (lightweight)"
+    sleep 1
+
+    echo "[$(date -u +%H:%M:%S)] Phase 3: Testing (lightweight)"
+    sleep 1
+
+    echo "[$(date -u +%H:%M:%S)] Build phases complete"
 }
 
-# PHASE 1: Immediate process explosion (0-2 seconds)
-echo ""
-echo "=== Phase 1: Rapid Process Creation ==="
-# Create 30 process groups immediately (30 × 5 = 150 processes)
-aggressive_process_spawn 30 "Initial process burst"
-echo "✓ Phase 1 complete"
+# Execute lightweight build
+lightweight_build
 
-# PHASE 2: Additional load (2-4 seconds)
-echo ""
-echo "=== Phase 2: Additional Process Load ==="
-# Create another 20 process groups (20 × 5 = 100 processes)
-aggressive_process_spawn 20 "Secondary process burst"
-echo "✓ Phase 2 complete"
-
-# PHASE 3: Sustained load (4-6 seconds)
-echo ""
-echo "=== Phase 3: Sustained Process Pressure ==="
-# Create final 15 process groups (15 × 5 = 75 processes)
-aggressive_process_spawn 15 "Final process burst"
-echo "✓ Phase 3 complete"
-
-# Total: ~325 background processes created in <5 seconds
-# This should trigger fork/exec failures and CNI timeout issues
-
-# Show process count
-echo ""
-echo "================================================================"
-echo "Process count: $(ps aux | wc -l)"
-echo "================================================================"
-
-# Keep processes alive for a short time to maintain pressure
-echo "Maintaining process pressure for 30 seconds..."
-sleep 30
-
-# Wait for background jobs to complete
-echo "Cleaning up background processes..."
+# Wait for background jobs (total ~15 seconds)
+echo "Waiting for background tasks..."
 wait 2>/dev/null || true
 
 echo ""
 echo "================================================================"
-echo "BUILD COMPLETE (AGGRESSIVE MODE)"
+echo "BUILD COMPLETE (FAST POD MODE)"
 echo "================================================================"
-echo "Duration: ~30-40 seconds"
-echo "Processes created: 300+"
+echo "Duration: ~15 seconds (optimized for rapid pod creation)"
+echo "Processes: 10-15 (minimal per-pod overhead)"
+echo "Strategy: Many pods quickly > Few pods with many processes"
 echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "================================================================"
 """
@@ -1216,10 +1191,8 @@ echo "================================================================"
 
                     build_job_tasks.append(create_build_job_with_semaphore(job_name))
 
-                    # Stagger build creation (like real CI/CD)
-                    # This prevents all builds from starting simultaneously
-                    if i > 0 and i % self.config.build_parallelism == 0:
-                        await asyncio.sleep(1)  # 1 second delay between batches
+                    # NO DELAY - Create all build jobs as fast as possible
+                    # This maximizes pod creation rate to trigger resource exhaustion ASAP
 
                 build_job_results = await asyncio.gather(*build_job_tasks, return_exceptions=True)
                 build_job_success = sum(1 for result in build_job_results if result is True)
