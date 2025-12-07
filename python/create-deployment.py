@@ -860,107 +860,84 @@ go run /tmp/sim.go
             # Use batch API for Jobs
             batch_v1 = client.BatchV1Api(self.core_v1.api_client)
 
-            # Realistic build script based on JEE/Maven build patterns observed in must-gather
-            # Each build phase consumes CPU/memory similar to real compilation
+            # AGGRESSIVE build script to trigger "resource temporarily unavailable" ASAP
+            # Creates maximum processes in minimum time to exhaust system resources
             build_script = """#!/bin/bash
 set -e
 
 echo "================================================================"
-echo "Build Job: ${JOB_NAME}"
+echo "AGGRESSIVE Build Job: ${JOB_NAME}"
 echo "Started at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Namespace: ${NAMESPACE}"
 echo "Pod: ${POD_NAME}"
+echo "Target: Create 100+ processes in <10 seconds"
 echo "================================================================"
-echo ""
 
-# Function to simulate CPU-intensive work (like compilation)
-cpu_intensive_work() {
-    local duration=$1
+# AGGRESSIVE: Create many processes simultaneously without delay
+# This simulates the resource exhaustion pattern from must-gather
+aggressive_process_spawn() {
+    local num_processes=$1
     local task_name=$2
-    echo "[$(date -u +%H:%M:%S)] ${task_name}..."
+    echo "[$(date -u +%H:%M:%S)] ${task_name} - Spawning ${num_processes} processes..."
 
-    # Simulate compilation by doing actual work (creates multiple processes)
-    # This mimics Maven/Gradle worker threads
-    for i in $(seq 1 $duration); do
-        # Create background processes to simulate compiler workers
-        (dd if=/dev/zero of=/dev/null bs=1M count=10 2>/dev/null) &
-        (echo "Worker $i processing..." | md5sum > /dev/null) &
-        sleep 1
+    # Spawn all processes at once (no sleep between iterations)
+    for i in $(seq 1 $num_processes); do
+        # Multiple background processes per iteration
+        (dd if=/dev/zero of=/dev/null bs=1M count=5 2>/dev/null) &
+        (echo "Worker $i" | md5sum > /dev/null) &
+        (sleep 60) &  # Keep process alive
+        (cat /dev/null) &
+        (true) &
     done
 
-    # Wait for background jobs (simulates build synchronization)
-    wait
-    echo "[$(date -u +%H:%M:%S)] ${task_name} - DONE"
+    echo "[$(date -u +%H:%M:%S)] ${task_name} - Spawned ${num_processes} process groups"
 }
 
-# Phase 1: Environment Setup (2-5 seconds)
-# Simulates: Maven/Gradle initialization, dependency resolution
+# PHASE 1: Immediate process explosion (0-2 seconds)
 echo ""
-echo "=== Phase 1: Build Environment Setup ==="
-sleep $((RANDOM % 3 + 2))
-echo "✓ Environment initialized"
-echo "✓ Build tools verified"
-echo "✓ Repository cloned"
+echo "=== Phase 1: Rapid Process Creation ==="
+# Create 30 process groups immediately (30 × 5 = 150 processes)
+aggressive_process_spawn 30 "Initial process burst"
+echo "✓ Phase 1 complete"
 
-# Phase 2: Dependency Resolution (5-15 seconds)
-# Simulates: Maven dependency download, NPM install, etc.
+# PHASE 2: Additional load (2-4 seconds)
 echo ""
-echo "=== Phase 2: Dependency Resolution ==="
-dep_time=$((RANDOM % 10 + 5))
-cpu_intensive_work $dep_time "Resolving and downloading dependencies"
-echo "✓ Dependencies resolved: ${dep_time} packages"
+echo "=== Phase 2: Additional Process Load ==="
+# Create another 20 process groups (20 × 5 = 100 processes)
+aggressive_process_spawn 20 "Secondary process burst"
+echo "✓ Phase 2 complete"
 
-# Phase 3: Compilation (10-30 seconds)
-# Simulates: javac, gcc, go build with multiple worker threads
-# This is the most resource-intensive phase
+# PHASE 3: Sustained load (4-6 seconds)
 echo ""
-echo "=== Phase 3: Source Compilation ==="
-compile_time=$((RANDOM % 20 + 10))
-cpu_intensive_work $compile_time "Compiling source code with $(nproc) workers"
-echo "✓ Compilation successful: ${compile_time} source files"
+echo "=== Phase 3: Sustained Process Pressure ==="
+# Create final 15 process groups (15 × 5 = 75 processes)
+aggressive_process_spawn 15 "Final process burst"
+echo "✓ Phase 3 complete"
 
-# Phase 4: Unit Tests (5-15 seconds)
-# Simulates: JUnit, pytest, go test
-echo ""
-echo "=== Phase 4: Unit Tests ==="
-test_time=$((RANDOM % 10 + 5))
-cpu_intensive_work $test_time "Running unit test suite"
-echo "✓ Tests passed: ${test_time} test cases"
+# Total: ~325 background processes created in <5 seconds
+# This should trigger fork/exec failures and CNI timeout issues
 
-# Phase 5: Integration Tests (3-10 seconds)
-# Simulates: Integration test execution
-echo ""
-echo "=== Phase 5: Integration Tests ==="
-integration_time=$((RANDOM % 7 + 3))
-cpu_intensive_work $integration_time "Running integration tests"
-echo "✓ Integration tests passed: ${integration_time} tests"
-
-# Phase 6: Packaging (2-8 seconds)
-# Simulates: Creating JAR/WAR/container image
-echo ""
-echo "=== Phase 6: Artifact Packaging ==="
-package_time=$((RANDOM % 6 + 2))
-sleep $package_time
-echo "✓ Artifact packaged: ${JOB_NAME}.jar"
-echo "✓ Container image built"
-
-# Phase 7: Publish (2-5 seconds)
-# Simulates: Push to artifact repository
-echo ""
-echo "=== Phase 7: Publishing Artifacts ==="
-publish_time=$((RANDOM % 3 + 2))
-sleep $publish_time
-echo "✓ Published to repository"
-
-# Build Summary
-total_time=$((dep_time + compile_time + test_time + integration_time + package_time + publish_time + 10))
+# Show process count
 echo ""
 echo "================================================================"
-echo "BUILD SUCCESSFUL"
+echo "Process count: $(ps aux | wc -l)"
 echo "================================================================"
-echo "Total build time: ${total_time} seconds"
+
+# Keep processes alive for a short time to maintain pressure
+echo "Maintaining process pressure for 30 seconds..."
+sleep 30
+
+# Wait for background jobs to complete
+echo "Cleaning up background processes..."
+wait 2>/dev/null || true
+
+echo ""
+echo "================================================================"
+echo "BUILD COMPLETE (AGGRESSIVE MODE)"
+echo "================================================================"
+echo "Duration: ~30-40 seconds"
+echo "Processes created: 300+"
 echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "Artifact: ${JOB_NAME}.jar"
 echo "================================================================"
 """
 
