@@ -138,7 +138,7 @@ func NewConfig() *Config {
 		CreateNetworkPolicies:      getEnvBool("CREATE_NETWORK_POLICIES", true),
 		CreateANPBANP:              getEnvBool("CREATE_ANP_BANP", true),
 		CreateImages:               getEnvBool("CREATE_IMAGES", true),
-		MaxConcurrentOperations:    getEnvInt("MAX_CONCURRENT_OPERATIONS", 20),
+		MaxConcurrentOperations:    getEnvInt("MAX_CONCURRENT_OPERATIONS", 30),
 		NamespaceReadyTimeout:      time.Duration(getEnvInt("NAMESPACE_READY_TIMEOUT", 60)) * time.Second,
 		ResourceRetryCount:         getEnvInt("RESOURCE_RETRY_COUNT", 5),
 		ResourceRetryDelay:         time.Duration(getEnvFloat("RESOURCE_RETRY_DELAY", 2.0)*1000) * time.Millisecond,
@@ -213,8 +213,8 @@ func (e *EtcdStressTools) setupKubernetesClients() error {
 		e.logInfo("Using in-cluster Kubernetes configuration", "MAIN")
 	}
 
-	config.QPS = 50.0
-	config.Burst = 100
+	config.QPS = 100.0
+	config.Burst = 200
 	config.Timeout = 60 * time.Second
 
 	config.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
