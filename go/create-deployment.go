@@ -90,7 +90,7 @@ func NewDeploymentConfig() *DeploymentConfig {
 		StatefulSetEnabled:      getEnvBool("STATEFULSET_ENABLED", false),
 		StatefulSetReplicas:     getEnvInt("STATEFULSET_REPLICAS", 3),
 		StatefulSetsPerNS:       getEnvInt("STATEFULSETS_PER_NS", 1),
-		BuildJobEnabled:         getEnvBool("BUILD_JOB_ENABLED", true),
+		BuildJobEnabled:         getEnvBool("BUILD_JOB_ENABLED", false),
 		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 20),
 		BuildParallelism:        getEnvInt("BUILD_PARALLELISM", 10),
 		BuildTimeout:            getEnvInt("BUILD_TIMEOUT", 300),
