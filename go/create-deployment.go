@@ -454,6 +454,8 @@ func (d *DeploymentTool) createDeployment(ctx context.Context, namespace, name s
 	// Wait for deployment to be ready
 	if err := d.waitForDeploymentReady(ctx, namespace, name, 300*time.Second); err != nil {
 		d.logWarn(fmt.Sprintf("Deployment %s pods not ready: %v", name, err), "DEPLOYMENT")
+		// Return error so it gets counted in error statistics
+		return fmt.Errorf("deployment %s pods not ready after timeout: %w", name, err)
 	}
 
 	// Create service if enabled
@@ -477,7 +479,18 @@ func (d *DeploymentTool) waitForDeploymentReady(ctx context.Context, namespace, 
 	for {
 		select {
 		case <-timeoutTimer.C:
-			return fmt.Errorf("timeout waiting for deployment %s", deploymentName)
+			// Timeout reached - get pod details for better error message
+			pods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+				LabelSelector: fmt.Sprintf("app=%s", deploymentName),
+			})
+			if err == nil && len(pods.Items) > 0 {
+				// Log pod statuses to help debugging
+				for _, pod := range pods.Items {
+					d.logWarn(fmt.Sprintf("Pod %s status: Phase=%s, Ready=%v",
+						pod.Name, pod.Status.Phase, isPodReady(&pod)), "DEPLOYMENT")
+				}
+			}
+			return fmt.Errorf("timeout waiting for deployment %s (pods may still be creating/pending)", deploymentName)
 		case <-ticker.C:
 			deployment, err := d.clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
 			if err != nil {
@@ -492,14 +505,51 @@ func (d *DeploymentTool) waitForDeploymentReady(ctx context.Context, namespace, 
 				specReplicas = *deployment.Spec.Replicas
 			}
 
+			// Check deployment replica counts first
 			if deployment.Status.ReadyReplicas == specReplicas &&
-				deployment.Status.AvailableReplicas == specReplicas {
-				return nil
+				deployment.Status.AvailableReplicas == specReplicas &&
+				specReplicas > 0 {
+
+				// Also verify actual pod status to ensure they're truly running
+				pods, err := d.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+					LabelSelector: fmt.Sprintf("app=%s", deploymentName),
+				})
+				if err != nil {
+					d.logWarn(fmt.Sprintf("Error listing pods for deployment %s: %v", deploymentName, err), "DEPLOYMENT")
+					continue
+				}
+
+				// Count pods that are actually running with all containers ready
+				runningPods := 0
+				for _, pod := range pods.Items {
+					if pod.Status.Phase == corev1.PodRunning && isPodReady(&pod) {
+						runningPods++
+					}
+				}
+
+				if runningPods == int(specReplicas) {
+					return nil
+				}
 			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
+}
+
+// isPodReady checks if all containers in a pod are ready
+func isPodReady(pod *corev1.Pod) bool {
+	if pod.Status.ContainerStatuses == nil || len(pod.Status.ContainerStatuses) == 0 {
+		return false
+	}
+
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if !containerStatus.Ready {
+			return false
+		}
+	}
+
+	return true
 }
 
 // createHeadlessService creates a headless service for StatefulSet
@@ -657,31 +707,42 @@ echo "Pod: ${POD_NAME}"
 echo "Strategy: Quick completion to trigger next pod ASAP"
 echo "================================================================"
 
-# Lightweight process spawn - just enough to simulate build activity
-# Goal: Complete quickly so next pod starts immediately
-lightweight_build() {
-    echo "[$(date -u +%H:%M:%S)] Starting lightweight build simulation..."
+# Increased thread/process spawn while maintaining fast completion
+# Goal: More threads per pod + quick completion for rapid pod turnover
+increased_thread_build() {
+    echo "[$(date -u +%H:%M:%S)] Starting build with increased thread count..."
 
-    # Create minimal background processes (10-15 total instead of 300+)
-    for i in $(seq 1 5); do
+    # Phase 1: Create multiple background process groups (60-80 total processes)
+    for i in $(seq 1 20); do
         (sleep 15 && echo "Worker $i done") &
+        (dd if=/dev/zero of=/dev/null bs=1M count=3 2>/dev/null) &
+        (echo "Thread $i" | md5sum > /dev/null) &
     done
 
-    # Simulate build phases with minimal overhead
-    echo "[$(date -u +%H:%M:%S)] Phase 1: Dependencies (lightweight)"
+    echo "[$(date -u +%H:%M:%S)] Phase 1: Dependencies (60+ threads spawned)"
     sleep 1
 
-    echo "[$(date -u +%H:%M:%S)] Phase 2: Compilation (lightweight)"
+    # Phase 2: Additional compilation threads
+    for i in $(seq 1 10); do
+        (sleep 12 && echo "Compiler $i done") &
+    done
+
+    echo "[$(date -u +%H:%M:%S)] Phase 2: Compilation (70+ threads total)"
     sleep 1
 
-    echo "[$(date -u +%H:%M:%S)] Phase 3: Testing (lightweight)"
+    # Phase 3: Test threads
+    for i in $(seq 1 10); do
+        (sleep 10 && echo "Test $i done") &
+    done
+
+    echo "[$(date -u +%H:%M:%S)] Phase 3: Testing (80+ threads total)"
     sleep 1
 
-    echo "[$(date -u +%H:%M:%S)] Build phases complete"
+    echo "[$(date -u +%H:%M:%S)] Build phases complete with increased thread count"
 }
 
-# Execute lightweight build
-lightweight_build
+# Execute build with increased thread count
+increased_thread_build
 
 # Wait for background jobs (total ~15 seconds)
 echo "Waiting for background tasks..."
@@ -689,11 +750,11 @@ wait 2>/dev/null || true
 
 echo ""
 echo "================================================================"
-echo "BUILD COMPLETE (FAST POD MODE)"
+echo "BUILD COMPLETE (INCREASED THREAD MODE)"
 echo "================================================================"
-echo "Duration: ~15 seconds (optimized for rapid pod creation)"
-echo "Processes: 10-15 (minimal per-pod overhead)"
-echo "Strategy: Many pods quickly > Few pods with many processes"
+echo "Duration: ~15 seconds (fast completion for rapid pod turnover)"
+echo "Threads/Processes: 80+ (increased for resource pressure)"
+echo "Strategy: Many pods with moderate threads for balanced load"
 echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "================================================================"`
 

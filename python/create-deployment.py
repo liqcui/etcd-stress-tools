@@ -875,31 +875,42 @@ echo "Pod: ${POD_NAME}"
 echo "Strategy: Quick completion to trigger next pod ASAP"
 echo "================================================================"
 
-# Lightweight process spawn - just enough to simulate build activity
-# Goal: Complete quickly so next pod starts immediately
-lightweight_build() {
-    echo "[$(date -u +%H:%M:%S)] Starting lightweight build simulation..."
+# Increased thread/process spawn while maintaining fast completion
+# Goal: More threads per pod + quick completion for rapid pod turnover
+increased_thread_build() {
+    echo "[$(date -u +%H:%M:%S)] Starting build with increased thread count..."
 
-    # Create minimal background processes (10-15 total instead of 300+)
-    for i in $(seq 1 5); do
+    # Phase 1: Create multiple background process groups (60-80 total processes)
+    for i in $(seq 1 20); do
         (sleep 15 && echo "Worker $i done") &
+        (dd if=/dev/zero of=/dev/null bs=1M count=3 2>/dev/null) &
+        (echo "Thread $i" | md5sum > /dev/null) &
     done
 
-    # Simulate build phases with minimal overhead
-    echo "[$(date -u +%H:%M:%S)] Phase 1: Dependencies (lightweight)"
+    echo "[$(date -u +%H:%M:%S)] Phase 1: Dependencies (60+ threads spawned)"
     sleep 1
 
-    echo "[$(date -u +%H:%M:%S)] Phase 2: Compilation (lightweight)"
+    # Phase 2: Additional compilation threads
+    for i in $(seq 1 10); do
+        (sleep 12 && echo "Compiler $i done") &
+    done
+
+    echo "[$(date -u +%H:%M:%S)] Phase 2: Compilation (70+ threads total)"
     sleep 1
 
-    echo "[$(date -u +%H:%M:%S)] Phase 3: Testing (lightweight)"
+    # Phase 3: Test threads
+    for i in $(seq 1 10); do
+        (sleep 10 && echo "Test $i done") &
+    done
+
+    echo "[$(date -u +%H:%M:%S)] Phase 3: Testing (80+ threads total)"
     sleep 1
 
-    echo "[$(date -u +%H:%M:%S)] Build phases complete"
+    echo "[$(date -u +%H:%M:%S)] Build phases complete with increased thread count"
 }
 
-# Execute lightweight build
-lightweight_build
+# Execute build with increased thread count
+increased_thread_build
 
 # Wait for background jobs (total ~15 seconds)
 echo "Waiting for background tasks..."
@@ -907,11 +918,11 @@ wait 2>/dev/null || true
 
 echo ""
 echo "================================================================"
-echo "BUILD COMPLETE (FAST POD MODE)"
+echo "BUILD COMPLETE (INCREASED THREAD MODE)"
 echo "================================================================"
-echo "Duration: ~15 seconds (optimized for rapid pod creation)"
-echo "Processes: 10-15 (minimal per-pod overhead)"
-echo "Strategy: Many pods quickly > Few pods with many processes"
+echo "Duration: ~15 seconds (fast completion for rapid pod turnover)"
+echo "Threads/Processes: 80+ (increased for resource pressure)"
+echo "Strategy: Many pods with moderate threads for balanced load"
 echo "Completed at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "================================================================"
 """
@@ -1038,7 +1049,7 @@ echo "================================================================"
             self.log_warn(f"Failed to create build job {name} in {namespace}: {e}", "BUILD_JOB")
             return False
 
-    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 300) -> bool:
+    async def wait_for_deployment_ready(self, namespace: str, deployment_name: str, timeout: int = 600) -> bool:
         """Wait for deployment pods to be ready"""
         deadline = time.time() + timeout
         
