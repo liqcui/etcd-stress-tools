@@ -284,6 +284,59 @@ class DeploymentTestTool:
         print(f"{Colors.RED}[{component}]{Colors.NC} {timestamp} - {message}")
         self.logger.error(f"[{component}] {message}")
 
+    def is_etcd_timeout(self, error: Exception) -> bool:
+        """Check if an error is an etcd timeout that should be retried"""
+        if not error:
+            return False
+        error_str = str(error).lower()
+        return ('etcdserver: request timed out' in error_str or
+                'context deadline exceeded' in error_str or
+                'timeout' in error_str)
+
+    async def retry_on_etcd_timeout(self, operation: str, max_retries: int, fn):
+        """Retry an async operation if it fails with etcd timeout"""
+        backoff = 2.0  # Start with 2 seconds
+        last_error = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = await fn()
+                if attempt > 0:
+                    self.log_info(f"{operation} succeeded after {attempt} retries", "RETRY")
+                return result
+            except ApiException as e:
+                last_error = e
+
+                # Don't retry if it's not an etcd timeout or if it's AlreadyExists
+                if not self.is_etcd_timeout(e) or e.status == 409:
+                    raise
+
+                if attempt < max_retries:
+                    self.log_warn(
+                        f"{operation} failed (attempt {attempt + 1}/{max_retries + 1}): {e.reason} - retrying in {backoff}s",
+                        "RETRY"
+                    )
+                    await asyncio.sleep(backoff)
+                    # Exponential backoff with max 30 seconds
+                    backoff = min(backoff * 2, 30.0)
+            except Exception as e:
+                last_error = e
+
+                # Don't retry non-API exceptions
+                if not self.is_etcd_timeout(e):
+                    raise
+
+                if attempt < max_retries:
+                    self.log_warn(
+                        f"{operation} failed (attempt {attempt + 1}/{max_retries + 1}): {e} - retrying in {backoff}s",
+                        "RETRY"
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+
+        self.log_error(f"{operation} failed after {max_retries + 1} retries: {last_error}", "RETRY")
+        raise last_error
+
     async def ensure_namespace(self, namespace_name: str) -> bool:
         """Create namespace and wait for it to be ready"""
         try:
@@ -345,89 +398,101 @@ class DeploymentTestTool:
         return False
 
     async def create_small_configmap(self, namespace: str, name: str) -> bool:
-        """Create a small ConfigMap"""
-        try:
-            data = {
-                f"config-{i}": f"value-{i}-{secrets.token_hex(4)}"
-                for i in range(3)
-            }
-            
-            configmap_body = client.V1ConfigMap(
-                metadata=client.V1ObjectMeta(
-                    name=name, 
-                    namespace=namespace,
-                    labels={'type': 'small-configmap', 'deployment-test': 'true'}
-                ),
-                data=data
-            )
-            
+        """Create a small ConfigMap with retry logic"""
+        data = {
+            f"config-{i}": f"value-{i}-{secrets.token_hex(4)}"
+            for i in range(3)
+        }
+
+        configmap_body = client.V1ConfigMap(
+            metadata=client.V1ObjectMeta(
+                name=name,
+                namespace=namespace,
+                labels={'type': 'small-configmap', 'deployment-test': 'true'}
+            ),
+            data=data
+        )
+
+        async def _create():
             await asyncio.to_thread(
                 self.core_v1.create_namespaced_config_map,
                 namespace=namespace,
                 body=configmap_body
             )
             return True
+
+        try:
+            return await self.retry_on_etcd_timeout(f"create ConfigMap {name}", 3, _create)
         except ApiException as e:
             if e.status == 409:
                 return True
             self.log_warn(f"Failed to create ConfigMap {name} in {namespace}: {e}", "CONFIGMAP")
             return False
+        except Exception as e:
+            self.log_warn(f"Failed to create ConfigMap {name} in {namespace}: {e}", "CONFIGMAP")
+            return False
 
     async def create_small_secret(self, namespace: str, name: str) -> bool:
-        """Create a small Secret"""
-        try:
-            data = {
-                "username": base64.b64encode(f"user-{secrets.token_hex(4)}".encode()).decode(),
-                "password": base64.b64encode(secrets.token_bytes(16)).decode(),
-            }
-            
-            secret_body = client.V1Secret(
-                metadata=client.V1ObjectMeta(
-                    name=name, 
-                    namespace=namespace,
-                    labels={'type': 'small-secret', 'deployment-test': 'true'}
-                ),
-                type="Opaque",
-                data=data
-            )
-            
+        """Create a small Secret with retry logic"""
+        data = {
+            "username": base64.b64encode(f"user-{secrets.token_hex(4)}".encode()).decode(),
+            "password": base64.b64encode(secrets.token_bytes(16)).decode(),
+        }
+
+        secret_body = client.V1Secret(
+            metadata=client.V1ObjectMeta(
+                name=name,
+                namespace=namespace,
+                labels={'type': 'small-secret', 'deployment-test': 'true'}
+            ),
+            type="Opaque",
+            data=data
+        )
+
+        async def _create():
             await asyncio.to_thread(
                 self.core_v1.create_namespaced_secret,
                 namespace=namespace,
                 body=secret_body
             )
             return True
+
+        try:
+            return await self.retry_on_etcd_timeout(f"create Secret {name}", 3, _create)
         except ApiException as e:
             if e.status == 409:
                 return True
             self.log_warn(f"Failed to create Secret {name} in {namespace}: {e}", "SECRET")
             return False
+        except Exception as e:
+            self.log_warn(f"Failed to create Secret {name} in {namespace}: {e}", "SECRET")
+            return False
 
     async def create_service(self, namespace: str, deployment_name: str) -> bool:
-        """Create a ClusterIP service for a deployment"""
-        try:
-            service_name = f"{deployment_name}-svc"
-            
-            service_body = client.V1Service(
-                metadata=client.V1ObjectMeta(
-                    name=service_name,
-                    namespace=namespace,
-                    labels={'app': deployment_name, 'deployment-test': 'true'}
-                ),
-                spec=client.V1ServiceSpec(
-                    selector={'app': deployment_name},
-                    ports=[
-                        client.V1ServicePort(
-                            name="http",
-                            port=8080,
-                            target_port=8080,
-                            protocol="TCP"
-                        )
-                    ],
-                    type="ClusterIP"
-                )
+        """Create a ClusterIP service for a deployment with retry logic"""
+        service_name = f"{deployment_name}-svc"
+
+        service_body = client.V1Service(
+            metadata=client.V1ObjectMeta(
+                name=service_name,
+                namespace=namespace,
+                labels={'app': deployment_name, 'deployment-test': 'true'}
+            ),
+            spec=client.V1ServiceSpec(
+                selector={'app': deployment_name},
+                ports=[
+                    client.V1ServicePort(
+                        name="http",
+                        port=8080,
+                        target_port=8080,
+                        protocol="TCP"
+                    )
+                ],
+                type="ClusterIP"
             )
-            
+        )
+
+        async def _create():
             await asyncio.to_thread(
                 self.core_v1.create_namespaced_service,
                 namespace=namespace,
@@ -435,9 +500,15 @@ class DeploymentTestTool:
             )
             self.log_info(f"Created service {service_name} in {namespace}", "SERVICE")
             return True
+
+        try:
+            return await self.retry_on_etcd_timeout(f"create Service {service_name}", 3, _create)
         except ApiException as e:
             if e.status == 409:
                 return True
+            self.log_warn(f"Failed to create Service {service_name} in {namespace}: {e}", "SERVICE")
+            return False
+        except Exception as e:
             self.log_warn(f"Failed to create Service {service_name} in {namespace}: {e}", "SERVICE")
             return False
 

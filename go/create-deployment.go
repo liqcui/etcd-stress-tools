@@ -260,7 +260,60 @@ func generateRandomHex(length int) string {
 	return hex.EncodeToString(bytes)
 }
 
-// createSmallConfigMap creates a small ConfigMap
+// isEtcdTimeout checks if an error is an etcd timeout that should be retried
+func isEtcdTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "etcdserver: request timed out") ||
+		strings.Contains(errStr, "context deadline exceeded") ||
+		strings.Contains(errStr, "timeout")
+}
+
+// retryOnEtcdTimeout retries an operation if it fails with etcd timeout
+func (d *DeploymentTool) retryOnEtcdTimeout(ctx context.Context, operation string, maxRetries int, fn func() error) error {
+	var lastErr error
+	backoff := 2 * time.Second
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err := fn()
+		if err == nil {
+			if attempt > 0 {
+				d.logInfo(fmt.Sprintf("%s succeeded after %d retries", operation, attempt), "RETRY")
+			}
+			return nil
+		}
+
+		lastErr = err
+
+		// Don't retry if it's not an etcd timeout or if it's AlreadyExists
+		if !isEtcdTimeout(err) || apierrors.IsAlreadyExists(err) {
+			return err
+		}
+
+		if attempt < maxRetries {
+			d.logWarn(fmt.Sprintf("%s failed (attempt %d/%d): %v - retrying in %v",
+				operation, attempt+1, maxRetries+1, err, backoff), "RETRY")
+
+			select {
+			case <-time.After(backoff):
+				// Exponential backoff with max 30 seconds
+				backoff = backoff * 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+
+	d.logError(fmt.Sprintf("%s failed after %d retries: %v", operation, maxRetries+1, lastErr), "RETRY")
+	return lastErr
+}
+
+// createSmallConfigMap creates a small ConfigMap with retry logic
 func (d *DeploymentTool) createSmallConfigMap(ctx context.Context, namespace, name string) error {
 	data := make(map[string]string)
 	for i := 0; i < 3; i++ {
@@ -279,14 +332,16 @@ func (d *DeploymentTool) createSmallConfigMap(ctx context.Context, namespace, na
 		Data: data,
 	}
 
-	_, err := d.clientset.CoreV1().ConfigMaps(namespace).Create(ctx, configMap, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create ConfigMap %s: %w", name, err)
-	}
-	return nil
+	return d.retryOnEtcdTimeout(ctx, fmt.Sprintf("create ConfigMap %s", name), 3, func() error {
+		_, err := d.clientset.CoreV1().ConfigMaps(namespace).Create(ctx, configMap, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create ConfigMap %s: %w", name, err)
+		}
+		return nil
+	})
 }
 
-// createSmallSecret creates a small Secret
+// createSmallSecret creates a small Secret with retry logic
 func (d *DeploymentTool) createSmallSecret(ctx context.Context, namespace, name string) error {
 	userBytes := make([]byte, 8)
 	passBytes := make([]byte, 16)
@@ -309,11 +364,13 @@ func (d *DeploymentTool) createSmallSecret(ctx context.Context, namespace, name 
 		},
 	}
 
-	_, err := d.clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create Secret %s: %w", name, err)
-	}
-	return nil
+	return d.retryOnEtcdTimeout(ctx, fmt.Sprintf("create Secret %s", name), 3, func() error {
+		_, err := d.clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create Secret %s: %w", name, err)
+		}
+		return nil
+	})
 }
 
 // createService creates a ClusterIP service
@@ -342,11 +399,13 @@ func (d *DeploymentTool) createService(ctx context.Context, namespace, deploymen
 		},
 	}
 
-	_, err := d.clientset.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create Service %s: %w", serviceName, err)
-	}
-	return nil
+	return d.retryOnEtcdTimeout(ctx, fmt.Sprintf("create Service %s", serviceName), 3, func() error {
+		_, err := d.clientset.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create Service %s: %w", serviceName, err)
+		}
+		return nil
+	})
 }
 
 // createDeployment creates deployment with mounted ConfigMaps and Secrets
@@ -446,9 +505,15 @@ func (d *DeploymentTool) createDeployment(ctx context.Context, namespace, name s
 		},
 	}
 
-	_, err := d.clientset.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create Deployment %s: %w", name, err)
+	err := d.retryOnEtcdTimeout(ctx, fmt.Sprintf("create Deployment %s", name), 3, func() error {
+		_, err := d.clientset.AppsV1().Deployments(namespace).Create(ctx, deployment, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create Deployment %s: %w", name, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	// Wait for deployment to be ready
@@ -576,11 +641,13 @@ func (d *DeploymentTool) createHeadlessService(ctx context.Context, namespace, s
 		},
 	}
 
-	_, err := d.clientset.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create headless Service %s: %w", serviceName, err)
-	}
-	return nil
+	return d.retryOnEtcdTimeout(ctx, fmt.Sprintf("create headless Service %s", serviceName), 3, func() error {
+		_, err := d.clientset.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create headless Service %s: %w", serviceName, err)
+		}
+		return nil
+	})
 }
 
 // createStatefulSet creates StatefulSet with OOM simulation
@@ -682,9 +749,15 @@ go run /tmp/sim.go`
 		},
 	}
 
-	_, err := d.clientset.AppsV1().StatefulSets(namespace).Create(ctx, statefulSet, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create StatefulSet %s: %w", name, err)
+	err := d.retryOnEtcdTimeout(ctx, fmt.Sprintf("create StatefulSet %s", name), 3, func() error {
+		_, err := d.clientset.AppsV1().StatefulSets(namespace).Create(ctx, statefulSet, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create StatefulSet %s: %w", name, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	d.logInfo(fmt.Sprintf("Created StatefulSet %s with %d replicas", name, replicas), "STATEFULSET")
@@ -846,9 +919,15 @@ echo "================================================================"`
 		},
 	}
 
-	_, err := d.clientset.BatchV1().Jobs(namespace).Create(ctx, job, metav1.CreateOptions{})
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create build job %s: %w", name, err)
+	err := d.retryOnEtcdTimeout(ctx, fmt.Sprintf("create build job %s", name), 3, func() error {
+		_, err := d.clientset.BatchV1().Jobs(namespace).Create(ctx, job, metav1.CreateOptions{})
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create build job %s: %w", name, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 
 	d.logInfo(fmt.Sprintf("Created build job %s (completions: %d, parallelism: %d)",
