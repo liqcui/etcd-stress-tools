@@ -1303,17 +1303,76 @@ echo "================================================================"
         except Exception as e:
             self.log_error(f"Cleanup failed: {e}", "CLEANUP")
 
+    async def wait_for_all_build_jobs(self):
+        """Wait for all build jobs to complete and report timing"""
+        if not self.config.build_job_enabled:
+            return
+
+        self.log_info("Waiting for all build jobs to complete...", "BUILD_JOB")
+        build_jobs_start = time.time()
+
+        # Use batch API for Jobs
+        batch_v1 = client.BatchV1Api(self.core_v1.api_client)
+
+        check_interval = 10  # Check every 10 seconds
+        max_wait_time = 3600  # Max 1 hour wait
+
+        while (time.time() - build_jobs_start) < max_wait_time:
+            try:
+                # List all build jobs across all namespaces
+                jobs = await asyncio.to_thread(
+                    batch_v1.list_job_for_all_namespaces,
+                    label_selector="type=build-job,deployment-test=true"
+                )
+
+                if not jobs.items:
+                    break
+
+                # Count job statuses
+                total_jobs = len(jobs.items)
+                completed_jobs = sum(1 for job in jobs.items if job.status.succeeded and job.status.succeeded > 0)
+                failed_jobs = sum(1 for job in jobs.items if job.status.failed and job.status.failed > 0)
+                active_jobs = sum(1 for job in jobs.items if job.status.active and job.status.active > 0)
+
+                if active_jobs == 0:
+                    # All jobs finished (either succeeded or failed)
+                    elapsed = time.time() - build_jobs_start
+                    self.log_info(
+                        f"All build jobs completed in {elapsed:.2f}s "
+                        f"(Total: {total_jobs}, Succeeded: {completed_jobs}, Failed: {failed_jobs})",
+                        "BUILD_JOB"
+                    )
+                    break
+
+                # Log progress
+                self.log_info(
+                    f"Build jobs status: Active={active_jobs}, Completed={completed_jobs}, Failed={failed_jobs}, Total={total_jobs}",
+                    "BUILD_JOB"
+                )
+
+                await asyncio.sleep(check_interval)
+
+            except Exception as e:
+                self.log_warn(f"Error checking build job status: {e}", "BUILD_JOB")
+                await asyncio.sleep(check_interval)
+
+        if (time.time() - build_jobs_start) >= max_wait_time:
+            self.log_warn("Timeout waiting for build jobs to complete", "BUILD_JOB")
+
     async def run_test(self):
         """Run the deployment test"""
         try:
             start_time = time.time()
             self.log_info("Starting deployment test", "MAIN")
-            
+
             await self.create_all_namespaces_and_deployments()
-            
+
+            # Wait for all build jobs to complete and report timing
+            await self.wait_for_all_build_jobs()
+
             if self.config.cleanup_on_completion:
                 await self.cleanup_all_resources()
-            
+
             total_time = time.time() - start_time
             self.log_info(f"Total execution time: {total_time:.2f} seconds", "MAIN")
             
