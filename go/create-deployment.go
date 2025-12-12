@@ -1072,12 +1072,87 @@ func (d *DeploymentTool) cleanupAllResources(ctx context.Context) {
 	d.logInfo(fmt.Sprintf("Deleted %d/%d namespaces", successful, len(namespaces.Items)), "CLEANUP")
 }
 
+// waitForAllBuildJobs waits for all build jobs to complete and reports timing
+func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) {
+	if !d.config.BuildJobEnabled {
+		return
+	}
+
+	d.logInfo("Waiting for all build jobs to complete...", "BUILD_JOB")
+	buildJobsStart := time.Now()
+
+	checkInterval := 10 * time.Second
+	maxWaitTime := 60 * time.Minute
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	timeout := time.NewTimer(maxWaitTime)
+	defer timeout.Stop()
+
+	for {
+		select {
+		case <-timeout.C:
+			d.logWarn("Timeout waiting for build jobs to complete", "BUILD_JOB")
+			return
+		case <-ticker.C:
+			// List all build jobs across all namespaces
+			jobs, err := d.clientset.BatchV1().Jobs("").List(ctx, metav1.ListOptions{
+				LabelSelector: "type=build-job,deployment-test=true",
+			})
+			if err != nil {
+				d.logWarn(fmt.Sprintf("Error checking build job status: %v", err), "BUILD_JOB")
+				continue
+			}
+
+			if len(jobs.Items) == 0 {
+				break
+			}
+
+			// Count job statuses
+			totalJobs := len(jobs.Items)
+			completedJobs := 0
+			failedJobs := 0
+			activeJobs := 0
+
+			for _, job := range jobs.Items {
+				if job.Status.Succeeded > 0 {
+					completedJobs++
+				}
+				if job.Status.Failed > 0 {
+					failedJobs++
+				}
+				if job.Status.Active > 0 {
+					activeJobs++
+				}
+			}
+
+			if activeJobs == 0 {
+				// All jobs finished (either succeeded or failed)
+				elapsed := time.Since(buildJobsStart)
+				d.logInfo(fmt.Sprintf("All build jobs completed in %.2fs (Total: %d, Succeeded: %d, Failed: %d)",
+					elapsed.Seconds(), totalJobs, completedJobs, failedJobs), "BUILD_JOB")
+				return
+			}
+
+			// Log progress
+			d.logInfo(fmt.Sprintf("Build jobs status: Active=%d, Completed=%d, Failed=%d, Total=%d",
+				activeJobs, completedJobs, failedJobs, totalJobs), "BUILD_JOB")
+		case <-ctx.Done():
+			d.logWarn("Context canceled while waiting for build jobs", "BUILD_JOB")
+			return
+		}
+	}
+}
+
 // runTest runs the deployment test
 func (d *DeploymentTool) runTest(ctx context.Context) error {
 	startTime := time.Now()
 	d.logInfo("Starting deployment test", "MAIN")
 
 	d.createAllNamespacesAndResources(ctx)
+
+	// Wait for all build jobs to complete and report timing
+	d.waitForAllBuildJobs(ctx)
 
 	if d.config.CleanupOnCompletion {
 		d.cleanupAllResources(ctx)
@@ -1091,20 +1166,21 @@ func (d *DeploymentTool) runTest(ctx context.Context) error {
 
 func main() {
 	var (
-		totalNamespaces     = flag.Int("total-namespaces", 0, "Total number of namespaces to create")
-		namespaceParallel   = flag.Int("namespace-parallel", 0, "Number of namespaces to process in parallel")
-		namespacePrefix     = flag.String("namespace-prefix", "", "Prefix for namespace names")
-		deploymentsPerNS    = flag.Int("deployments-per-ns", 0, "Number of deployments per namespace")
-		serviceEnabled      = flag.Bool("service-enabled", false, "Enable service creation")
-		statefulSetEnabled  = flag.Bool("statefulset-enabled", false, "Enable StatefulSet creation")
-		statefulSetReplicas = flag.Int("statefulset-replicas", 0, "Number of replicas per StatefulSet")
-		statefulSetsPerNS   = flag.Int("statefulsets-per-ns", 0, "Number of StatefulSets per namespace")
-		buildJobEnabled     = flag.Bool("build-job-enabled", false, "Enable build job creation")
-		buildsPerNS         = flag.Int("builds-per-ns", 0, "Number of build completions per job")
-		buildParallelism    = flag.Int("build-parallelism", 0, "Number of concurrent build pods")
-		buildTimeout        = flag.Int("build-timeout", 0, "Build job timeout in seconds")
-		cleanup             = flag.Bool("cleanup", false, "Enable cleanup after completion")
-		help                = flag.Bool("help", false, "Show help message")
+		totalNamespaces         = flag.Int("total-namespaces", 0, "Total number of namespaces to create")
+		namespaceParallel       = flag.Int("namespace-parallel", 0, "Number of namespaces to process in parallel")
+		namespacePrefix         = flag.String("namespace-prefix", "", "Prefix for namespace names")
+		deploymentsPerNS        = flag.Int("deployments-per-ns", 0, "Number of deployments per namespace")
+		maxConcurrentOperations = flag.Int("max-concurrent-operations", 0, "Maximum number of concurrent operations")
+		serviceEnabled          = flag.Bool("service-enabled", false, "Enable service creation")
+		statefulSetEnabled      = flag.Bool("statefulset-enabled", false, "Enable StatefulSet creation")
+		statefulSetReplicas     = flag.Int("statefulset-replicas", 0, "Number of replicas per StatefulSet")
+		statefulSetsPerNS       = flag.Int("statefulsets-per-ns", 0, "Number of StatefulSets per namespace")
+		buildJobEnabled         = flag.Bool("build-job-enabled", false, "Enable build job creation")
+		buildsPerNS             = flag.Int("builds-per-ns", 0, "Number of build completions per job")
+		buildParallelism        = flag.Int("build-parallelism", 0, "Number of concurrent build pods")
+		buildTimeout            = flag.Int("build-timeout", 0, "Build job timeout in seconds")
+		cleanup                 = flag.Bool("cleanup", false, "Enable cleanup after completion")
+		help                    = flag.Bool("help", false, "Show help message")
 	)
 
 	flag.Usage = func() {
@@ -1144,6 +1220,9 @@ Usage:
 	}
 	if *deploymentsPerNS != 0 {
 		config.DeploymentsPerNS = *deploymentsPerNS
+	}
+	if *maxConcurrentOperations != 0 {
+		config.MaxConcurrentOperations = *maxConcurrentOperations
 	}
 	if *serviceEnabled {
 		config.ServiceEnabled = true
