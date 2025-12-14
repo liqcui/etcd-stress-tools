@@ -74,7 +74,7 @@ class Config:
         self.build_job_enabled = os.getenv('BUILD_JOB_ENABLED', 'true').lower() == 'true'
         self.builds_per_ns = int(os.getenv('BUILDS_PER_NS', '20'))  # More completions = more pods
         self.build_parallelism = int(os.getenv('BUILD_PARALLELISM', '10'))  # Higher parallelism = faster creation
-        self.build_timeout = int(os.getenv('BUILD_TIMEOUT', '300'))  # 5 minutes (faster timeout)
+        self.build_timeout = int(os.getenv('BUILD_TIMEOUT', '600'))  # 10 minutes timeout
     
     def _get_verify_ssl_setting(self) -> Optional[bool]:
         """Get SSL verification setting from environment"""
@@ -1374,6 +1374,83 @@ echo "================================================================"
         except Exception as e:
             self.log_error(f"Cleanup failed: {e}", "CLEANUP")
 
+    def print_build_job_summary(self, jobs):
+        """Print detailed build job statistics per namespace"""
+        # Group jobs by namespace and count pod completions (not job objects)
+        namespace_stats = {}
+
+        for job in jobs:
+            ns = job.metadata.namespace
+            if ns not in namespace_stats:
+                namespace_stats[ns] = {
+                    'total_pods': 0,
+                    'succeeded_pods': 0,
+                    'failed_pods': 0,
+                    'active_pods': 0,
+                    'job_count': 0
+                }
+
+            # Count the job
+            namespace_stats[ns]['job_count'] += 1
+
+            # Count pod completions from job status
+            succeeded = job.status.succeeded if job.status.succeeded else 0
+            failed = job.status.failed if job.status.failed else 0
+            active = job.status.active if job.status.active else 0
+
+            namespace_stats[ns]['succeeded_pods'] += succeeded
+            namespace_stats[ns]['failed_pods'] += failed
+            namespace_stats[ns]['active_pods'] += active
+            namespace_stats[ns]['total_pods'] += (succeeded + failed + active)
+
+        # Print summary header
+        self.log_info("", "BUILD_SUMMARY")
+        self.log_info("========================================", "BUILD_SUMMARY")
+        self.log_info("BUILD JOB SUMMARY BY NAMESPACE", "BUILD_SUMMARY")
+        self.log_info("========================================", "BUILD_SUMMARY")
+
+        # Calculate totals
+        total_pods = 0
+        total_succeeded = 0
+        total_failed = 0
+        total_active = 0
+        total_job_count = 0
+
+        # Print per-namespace stats
+        for ns in sorted(namespace_stats.keys()):
+            stats = namespace_stats[ns]
+            total_pods += stats['total_pods']
+            total_succeeded += stats['succeeded_pods']
+            total_failed += stats['failed_pods']
+            total_active += stats['active_pods']
+            total_job_count += stats['job_count']
+
+            success_rate = 0.0
+            if stats['total_pods'] > 0:
+                success_rate = (stats['succeeded_pods'] / stats['total_pods']) * 100
+
+            self.log_info(
+                f"Namespace: {ns:<30} | Jobs: {stats['job_count']:3d} | "
+                f"Total Pods: {stats['total_pods']:3d} | Succeeded: {stats['succeeded_pods']:3d} | "
+                f"Failed: {stats['failed_pods']:3d} | Success Rate: {success_rate:.1f}%",
+                "BUILD_SUMMARY"
+            )
+
+        # Print overall summary
+        self.log_info("========================================", "BUILD_SUMMARY")
+        overall_success_rate = 0.0
+        if total_pods > 0:
+            overall_success_rate = (total_succeeded / total_pods) * 100
+
+        self.log_info(f"TOTAL BUILD JOBS: {total_job_count}", "BUILD_SUMMARY")
+        self.log_info(f"TOTAL BUILD PODS: {total_pods}", "BUILD_SUMMARY")
+        self.log_info(f"  - Succeeded: {total_succeeded} ({overall_success_rate:.1f}%)", "BUILD_SUMMARY")
+        self.log_info(f"  - Failed: {total_failed} ({100 - overall_success_rate:.1f}%)", "BUILD_SUMMARY")
+        if total_active > 0:
+            self.log_info(f"  - Active: {total_active}", "BUILD_SUMMARY")
+        self.log_info(f"  - Success Rate: {overall_success_rate:.1f}%", "BUILD_SUMMARY")
+        self.log_info("========================================", "BUILD_SUMMARY")
+
     async def wait_for_all_build_jobs(self):
         """Wait for all build jobs to complete and report timing"""
         if not self.config.build_job_enabled:
@@ -1413,6 +1490,9 @@ echo "================================================================"
                         f"(Total: {total_jobs}, Succeeded: {completed_jobs}, Failed: {failed_jobs})",
                         "BUILD_JOB"
                     )
+
+                    # Print per-namespace summary
+                    self.print_build_job_summary(jobs.items)
                     break
 
                 # Log progress
