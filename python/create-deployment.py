@@ -1451,6 +1451,62 @@ echo "================================================================"
         self.log_info(f"  - Success Rate: {overall_success_rate:.1f}%", "BUILD_SUMMARY")
         self.log_info("========================================", "BUILD_SUMMARY")
 
+    async def list_failed_build_pods(self):
+        """List all failed pods in test namespaces
+
+        Equivalent to: oc get pods -A |grep test |grep -v -E "Running|Completed"
+        """
+        self.log_info("", "BUILD_SUMMARY")
+        self.log_info("FAILED PODS:", "BUILD_SUMMARY")
+        self.log_info("========================================", "BUILD_SUMMARY")
+
+        try:
+            # List all pods across all namespaces with deployment-test label
+            pods = await asyncio.to_thread(
+                self.core_v1.list_pod_for_all_namespaces,
+                label_selector="deployment-test=true"
+            )
+
+            failed_count = 0
+            for pod in pods.items:
+                # Skip pods that are Running or Succeeded (Completed)
+                if pod.status.phase in ["Running", "Succeeded"]:
+                    continue
+
+                # Log failed/pending/unknown pods
+                failed_count += 1
+                self.log_info(
+                    f"  {pod.metadata.namespace}/{pod.metadata.name} - Phase: {pod.status.phase}",
+                    "BUILD_SUMMARY"
+                )
+
+                # Show container statuses if available
+                if pod.status.container_statuses:
+                    for container_status in pod.status.container_statuses:
+                        if container_status.state.waiting:
+                            self.log_info(
+                                f"    Container {container_status.name}: Waiting - "
+                                f"{container_status.state.waiting.reason}: {container_status.state.waiting.message}",
+                                "BUILD_SUMMARY"
+                            )
+                        if container_status.state.terminated:
+                            self.log_info(
+                                f"    Container {container_status.name}: Terminated - "
+                                f"Reason: {container_status.state.terminated.reason}, "
+                                f"Exit Code: {container_status.state.terminated.exit_code}",
+                                "BUILD_SUMMARY"
+                            )
+
+            if failed_count == 0:
+                self.log_info("  No failed pods found (all pods are Running or Completed)", "BUILD_SUMMARY")
+            else:
+                self.log_info(f"Total failed/pending pods: {failed_count}", "BUILD_SUMMARY")
+
+            self.log_info("========================================", "BUILD_SUMMARY")
+
+        except Exception as e:
+            self.log_warn(f"Failed to list pods: {e}", "BUILD_SUMMARY")
+
     async def wait_for_all_build_jobs(self):
         """Wait for all build jobs to complete and report timing"""
         if not self.config.build_job_enabled:
@@ -1493,6 +1549,9 @@ echo "================================================================"
 
                     # Print per-namespace summary
                     self.print_build_job_summary(jobs.items)
+
+                    # List all failed pods (including build pods and deployment pods)
+                    await self.list_failed_build_pods()
                     break
 
                 # Log progress
