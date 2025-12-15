@@ -1451,8 +1451,8 @@ echo "================================================================"
         self.log_info(f"  - Success Rate: {overall_success_rate:.1f}%", "BUILD_SUMMARY")
         self.log_info("========================================", "BUILD_SUMMARY")
 
-    async def list_failed_build_pods(self):
-        """List all failed pods in test namespaces
+    async def list_failed_build_pods(self) -> int:
+        """List all failed pods in test namespaces and return the count
 
         Equivalent to: oc get pods -A |grep test |grep -v -E "Running|Completed"
         """
@@ -1466,6 +1466,8 @@ echo "================================================================"
                 self.core_v1.list_pod_for_all_namespaces,
                 label_selector="deployment-test=true"
             )
+
+            self.log_info(f"Total pods found: {len(pods.items)}", "BUILD_SUMMARY")
 
             failed_count = 0
             for pod in pods.items:
@@ -1504,13 +1506,16 @@ echo "================================================================"
 
             self.log_info("========================================", "BUILD_SUMMARY")
 
+            return failed_count
+
         except Exception as e:
             self.log_warn(f"Failed to list pods: {e}", "BUILD_SUMMARY")
+            return 0
 
-    async def wait_for_all_build_jobs(self):
+    async def wait_for_all_build_jobs(self) -> int:
         """Wait for all build jobs to complete and report timing"""
         if not self.config.build_job_enabled:
-            return
+            return 0
 
         self.log_info("Waiting for all build jobs to complete...", "BUILD_JOB")
         build_jobs_start = time.time()
@@ -1551,8 +1556,8 @@ echo "================================================================"
                     self.print_build_job_summary(jobs.items)
 
                     # List all failed pods (including build pods and deployment pods)
-                    await self.list_failed_build_pods()
-                    break
+                    failed_count = await self.list_failed_build_pods()
+                    return failed_count
 
                 # Log progress
                 self.log_info(
@@ -1569,6 +1574,8 @@ echo "================================================================"
         if (time.time() - build_jobs_start) >= max_wait_time:
             self.log_warn("Timeout waiting for build jobs to complete", "BUILD_JOB")
 
+        return 0
+
     async def run_test(self):
         """Run the deployment test"""
         try:
@@ -1578,12 +1585,18 @@ echo "================================================================"
             await self.create_all_namespaces_and_deployments()
 
             # Wait for all build jobs to complete and report timing
-            await self.wait_for_all_build_jobs()
+            failed_pod_count = await self.wait_for_all_build_jobs()
+
+            # List all failed pods if build jobs are not enabled
+            if not self.config.build_job_enabled:
+                failed_pod_count = await self.list_failed_build_pods()
 
             if self.config.cleanup_on_completion:
                 await self.cleanup_all_resources()
 
             total_time = time.time() - start_time
+            if failed_pod_count > 0:
+                self.log_info(f"Total failed/pending pods: {failed_pod_count}", "MAIN")
             self.log_info(f"Total execution time: {total_time:.2f} seconds", "MAIN")
             
         except KeyboardInterrupt:

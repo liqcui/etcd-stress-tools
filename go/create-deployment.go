@@ -1227,10 +1227,67 @@ func (d *DeploymentTool) printBuildJobSummary(ctx context.Context, jobs []batchv
 	d.logInfo("========================================", "BUILD_SUMMARY")
 }
 
+// listFailedBuildPods lists all failed pods in test namespaces and returns the count
+// Equivalent to: oc get pods -A |grep test |grep -v -E "Running|Completed"
+func (d *DeploymentTool) listFailedBuildPods(ctx context.Context) int {
+	d.logInfo("", "BUILD_SUMMARY")
+	d.logInfo("FAILED PODS:", "BUILD_SUMMARY")
+	d.logInfo("========================================", "BUILD_SUMMARY")
+
+	// List all pods across all namespaces with deployment-test label
+	pods, err := d.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		LabelSelector: "deployment-test=true",
+	})
+	if err != nil {
+		d.logWarn(fmt.Sprintf("Failed to list pods: %v", err), "BUILD_SUMMARY")
+		return 0
+	}
+
+	d.logInfo(fmt.Sprintf("Total pods found: %d", len(pods.Items)), "BUILD_SUMMARY")
+
+	failedCount := 0
+	for _, pod := range pods.Items {
+		// Skip pods that are Running or Succeeded (Completed)
+		if pod.Status.Phase == corev1.PodRunning || pod.Status.Phase == corev1.PodSucceeded {
+			continue
+		}
+
+		// Log failed/pending/unknown pods
+		failedCount++
+		d.logInfo(fmt.Sprintf("  %s/%s - Phase: %s",
+			pod.Namespace, pod.Name, pod.Status.Phase), "BUILD_SUMMARY")
+
+		// Show container statuses if available
+		for _, containerStatus := range pod.Status.ContainerStatuses {
+			if containerStatus.State.Waiting != nil {
+				d.logInfo(fmt.Sprintf("    Container %s: Waiting - %s: %s",
+					containerStatus.Name,
+					containerStatus.State.Waiting.Reason,
+					containerStatus.State.Waiting.Message), "BUILD_SUMMARY")
+			}
+			if containerStatus.State.Terminated != nil {
+				d.logInfo(fmt.Sprintf("    Container %s: Terminated - Reason: %s, Exit Code: %d",
+					containerStatus.Name,
+					containerStatus.State.Terminated.Reason,
+					containerStatus.State.Terminated.ExitCode), "BUILD_SUMMARY")
+			}
+		}
+	}
+
+	if failedCount == 0 {
+		d.logInfo("  No failed pods found (all pods are Running or Completed)", "BUILD_SUMMARY")
+	} else {
+		d.logInfo(fmt.Sprintf("Total failed/pending pods: %d", failedCount), "BUILD_SUMMARY")
+	}
+	d.logInfo("========================================", "BUILD_SUMMARY")
+
+	return failedCount
+}
+
 // waitForAllBuildJobs waits for all build jobs to complete and reports timing
-func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) {
+func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) int {
 	if !d.config.BuildJobEnabled {
-		return
+		return 0
 	}
 
 	d.logInfo("Waiting for all build jobs to complete...", "BUILD_JOB")
@@ -1248,7 +1305,7 @@ func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) {
 		select {
 		case <-timeout.C:
 			d.logWarn("Timeout waiting for build jobs to complete", "BUILD_JOB")
-			return
+			return 0
 		case <-ticker.C:
 			// List all build jobs across all namespaces
 			jobs, err := d.clientset.BatchV1().Jobs("").List(ctx, metav1.ListOptions{
@@ -1291,7 +1348,10 @@ func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) {
 
 				// Print per-namespace summary
 				d.printBuildJobSummary(ctx, jobs.Items)
-				return
+
+				// List all failed pods (including build pods and deployment pods)
+				failedCount := d.listFailedBuildPods(ctx)
+				return failedCount
 			}
 
 			// Log progress
@@ -1299,7 +1359,7 @@ func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) {
 				activeJobs, completedJobs, failedJobs, totalJobs), "BUILD_JOB")
 		case <-ctx.Done():
 			d.logWarn("Context canceled while waiting for build jobs", "BUILD_JOB")
-			return
+			return 0
 		}
 	}
 }
@@ -1312,13 +1372,21 @@ func (d *DeploymentTool) runTest(ctx context.Context) error {
 	d.createAllNamespacesAndResources(ctx)
 
 	// Wait for all build jobs to complete and report timing
-	d.waitForAllBuildJobs(ctx)
+	failedPodCount := d.waitForAllBuildJobs(ctx)
+
+	// List all failed pods if build jobs are not enabled
+	if !d.config.BuildJobEnabled {
+		failedPodCount = d.listFailedBuildPods(ctx)
+	}
 
 	if d.config.CleanupOnCompletion {
 		d.cleanupAllResources(ctx)
 	}
 
 	totalTime := time.Since(startTime)
+	if failedPodCount > 0 {
+		d.logInfo(fmt.Sprintf("Total failed/pending pods: %d", failedPodCount), "MAIN")
+	}
 	d.logInfo(fmt.Sprintf("Total execution time: %.2f seconds", totalTime.Seconds()), "MAIN")
 
 	return nil
