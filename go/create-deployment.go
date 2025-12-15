@@ -94,7 +94,7 @@ func NewDeploymentConfig() *DeploymentConfig {
 		BuildJobEnabled:         getEnvBool("BUILD_JOB_ENABLED", false),
 		BuildsPerNS:             getEnvInt("BUILDS_PER_NS", 20),
 		BuildParallelism:        getEnvInt("BUILD_PARALLELISM", 10),
-		BuildTimeout:            getEnvInt("BUILD_TIMEOUT", 300),
+		BuildTimeout:            getEnvInt("BUILD_TIMEOUT", 600),
 		CurlTestEnabled:         getEnvBool("CURL_TEST_ENABLED", false),
 		CurlTestInterval:        getEnvInt("CURL_TEST_INTERVAL", 30),
 		CurlTestCount:           getEnvInt("CURL_TEST_COUNT", 10),
@@ -1152,6 +1152,81 @@ func (d *DeploymentTool) cleanupAllResources(ctx context.Context) {
 	d.logInfo(fmt.Sprintf("Deleted %d/%d namespaces", successful, len(namespaces.Items)), "CLEANUP")
 }
 
+// printBuildJobSummary prints detailed build job statistics per namespace
+func (d *DeploymentTool) printBuildJobSummary(ctx context.Context, jobs []batchv1.Job) {
+	// Group jobs by namespace and count pod completions (not job objects)
+	namespaceStats := make(map[string]struct {
+		TotalPods     int
+		SucceededPods int
+		FailedPods    int
+		ActivePods    int
+		JobCount      int
+	})
+
+	for _, job := range jobs {
+		ns := job.Namespace
+		stats := namespaceStats[ns]
+
+		// Count the job
+		stats.JobCount++
+
+		// Count pod completions from job status
+		succeeded := int(job.Status.Succeeded)
+		failed := int(job.Status.Failed)
+		active := int(job.Status.Active)
+
+		stats.SucceededPods += succeeded
+		stats.FailedPods += failed
+		stats.ActivePods += active
+		stats.TotalPods += (succeeded + failed + active)
+
+		namespaceStats[ns] = stats
+	}
+
+	// Print summary header
+	d.logInfo("", "BUILD_SUMMARY")
+	d.logInfo("========================================", "BUILD_SUMMARY")
+	d.logInfo("BUILD JOB SUMMARY BY NAMESPACE", "BUILD_SUMMARY")
+	d.logInfo("========================================", "BUILD_SUMMARY")
+
+	// Calculate totals
+	var totalPods, totalSucceeded, totalFailed, totalActive, totalJobCount int
+
+	// Print per-namespace stats
+	for ns, stats := range namespaceStats {
+		totalPods += stats.TotalPods
+		totalSucceeded += stats.SucceededPods
+		totalFailed += stats.FailedPods
+		totalActive += stats.ActivePods
+		totalJobCount += stats.JobCount
+
+		successRate := 0.0
+		if stats.TotalPods > 0 {
+			successRate = float64(stats.SucceededPods) / float64(stats.TotalPods) * 100
+		}
+
+		d.logInfo(fmt.Sprintf("Namespace: %-30s | Jobs: %3d | Total Pods: %3d | Succeeded: %3d | Failed: %3d | Success Rate: %.1f%%",
+			ns, stats.JobCount, stats.TotalPods, stats.SucceededPods, stats.FailedPods, successRate), "BUILD_SUMMARY")
+	}
+
+	// Print overall summary
+	d.logInfo("========================================", "BUILD_SUMMARY")
+	overallSuccessRate := 0.0
+	if totalPods > 0 {
+		overallSuccessRate = float64(totalSucceeded) / float64(totalPods) * 100
+	}
+
+	d.logInfo(fmt.Sprintf("TOTAL BUILD JOBS: %d", totalJobCount), "BUILD_SUMMARY")
+	d.logInfo(fmt.Sprintf("TOTAL BUILD PODS: %d", totalPods), "BUILD_SUMMARY")
+	d.logInfo(fmt.Sprintf("  - Succeeded: %d (%.1f%%)", totalSucceeded, overallSuccessRate), "BUILD_SUMMARY")
+	d.logInfo(fmt.Sprintf("  - Failed: %d (%.1f%%)", totalFailed, 100-overallSuccessRate), "BUILD_SUMMARY")
+	if totalActive > 0 {
+		d.logInfo(fmt.Sprintf("  - Active: %d", totalActive), "BUILD_SUMMARY")
+	}
+	d.logInfo(fmt.Sprintf("  - Success Rate: %.1f%%", overallSuccessRate), "BUILD_SUMMARY")
+	d.logInfo("========================================", "BUILD_SUMMARY")
+}
+
 // waitForAllBuildJobs waits for all build jobs to complete and reports timing
 func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) {
 	if !d.config.BuildJobEnabled {
@@ -1209,8 +1284,13 @@ func (d *DeploymentTool) waitForAllBuildJobs(ctx context.Context) {
 			if activeJobs == 0 {
 				// All jobs finished (either succeeded or failed)
 				elapsed := time.Since(buildJobsStart)
+
+				// Calculate detailed statistics
 				d.logInfo(fmt.Sprintf("All build jobs completed in %.2fs (Total: %d, Succeeded: %d, Failed: %d)",
 					elapsed.Seconds(), totalJobs, completedJobs, failedJobs), "BUILD_JOB")
+
+				// Print per-namespace summary
+				d.printBuildJobSummary(ctx, jobs.Items)
 				return
 			}
 
