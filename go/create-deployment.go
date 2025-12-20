@@ -161,7 +161,7 @@ func (d *DeploymentTool) setupKubernetesClient() error {
 	}
 
 	// Set client configuration
-	config.QPS = 200.0
+	config.QPS = 300.0
 	config.Burst = 300
 	config.Timeout = 60 * time.Second
 
