@@ -468,6 +468,56 @@ class DeploymentTestTool:
             self.log_warn(f"Failed to create Secret {name} in {namespace}: {e}", "SECRET")
             return False
 
+    async def verify_configmap_exists(self, namespace: str, name: str) -> bool:
+        """Verify that a ConfigMap exists and is ready"""
+        max_retries = 10
+        backoff = 0.5  # Start with 500ms
+
+        for attempt in range(max_retries):
+            try:
+                await asyncio.to_thread(
+                    self.core_v1.read_namespaced_config_map,
+                    name=name,
+                    namespace=namespace
+                )
+                return True
+            except ApiException as e:
+                if e.status != 404:
+                    self.log_warn(f"Error verifying ConfigMap {name}: {e}", "DEPLOYMENT")
+                    return False
+
+                # ConfigMap not found yet, retry
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)  # Max 5 seconds
+
+        self.log_warn(f"ConfigMap {name} not found after {max_retries} retries", "DEPLOYMENT")
+        return False
+
+    async def verify_secret_exists(self, namespace: str, name: str) -> bool:
+        """Verify that a Secret exists and is ready"""
+        max_retries = 10
+        backoff = 0.5  # Start with 500ms
+
+        for attempt in range(max_retries):
+            try:
+                await asyncio.to_thread(
+                    self.core_v1.read_namespaced_secret,
+                    name=name,
+                    namespace=namespace
+                )
+                return True
+            except ApiException as e:
+                if e.status != 404:
+                    self.log_warn(f"Error verifying Secret {name}: {e}", "DEPLOYMENT")
+                    return False
+
+                # Secret not found yet, retry
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)  # Max 5 seconds
+
+        self.log_warn(f"Secret {name} not found after {max_retries} retries", "DEPLOYMENT")
+        return False
+
     async def create_service(self, namespace: str, deployment_name: str) -> bool:
         """Create a ClusterIP service for a deployment with retry logic"""
         service_name = f"{deployment_name}-svc"
@@ -667,7 +717,17 @@ tail -f /dev/null
                 results = await asyncio.gather(*resource_tasks, return_exceptions=True)
                 if not all(r is True for r in results if not isinstance(r, Exception)):
                     self.log_warn(f"Some resources failed for deployment {name}", "DEPLOYMENT")
-                
+
+                # Verify all ConfigMaps and Secrets exist before creating deployment
+                # This prevents "MountVolume.SetUp failed" errors
+                for cm_name in cm_names:
+                    if not await self.verify_configmap_exists(namespace, cm_name):
+                        return False
+
+                for secret_name in secret_names:
+                    if not await self.verify_secret_exists(namespace, secret_name):
+                        return False
+
                 # Create volumes and volume mounts
                 volumes = []
                 volume_mounts = []

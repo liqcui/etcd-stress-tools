@@ -374,6 +374,58 @@ func (d *DeploymentTool) createSmallSecret(ctx context.Context, namespace, name 
 	})
 }
 
+// verifyConfigMapExists verifies that a ConfigMap exists and is ready
+func (d *DeploymentTool) verifyConfigMapExists(ctx context.Context, namespace, name string) error {
+	maxRetries := 10
+	backoff := 500 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		_, err := d.clientset.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		// ConfigMap not found yet, retry
+		time.Sleep(backoff)
+		backoff = backoff * 2
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
+		}
+	}
+
+	return fmt.Errorf("ConfigMap %s not found after %d retries", name, maxRetries)
+}
+
+// verifySecretExists verifies that a Secret exists and is ready
+func (d *DeploymentTool) verifySecretExists(ctx context.Context, namespace, name string) error {
+	maxRetries := 10
+	backoff := 500 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		_, err := d.clientset.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err == nil {
+			return nil
+		}
+
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+
+		// Secret not found yet, retry
+		time.Sleep(backoff)
+		backoff = backoff * 2
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
+		}
+	}
+
+	return fmt.Errorf("Secret %s not found after %d retries", name, maxRetries)
+}
+
 // createService creates a ClusterIP service
 func (d *DeploymentTool) createService(ctx context.Context, namespace, deploymentName string) error {
 	serviceName := fmt.Sprintf("%s-svc", deploymentName)
@@ -426,6 +478,20 @@ func (d *DeploymentTool) createDeployment(ctx context.Context, namespace, name s
 	for _, secretName := range secretNames {
 		if err := d.createSmallSecret(ctx, namespace, secretName); err != nil {
 			return err
+		}
+	}
+
+	// Verify all ConfigMaps and Secrets exist before creating deployment
+	// This prevents "MountVolume.SetUp failed" errors
+	for _, cmName := range cmNames {
+		if err := d.verifyConfigMapExists(ctx, namespace, cmName); err != nil {
+			return fmt.Errorf("failed to verify ConfigMap %s: %w", cmName, err)
+		}
+	}
+
+	for _, secretName := range secretNames {
+		if err := d.verifySecretExists(ctx, namespace, secretName); err != nil {
+			return fmt.Errorf("failed to verify Secret %s: %w", secretName, err)
 		}
 	}
 
