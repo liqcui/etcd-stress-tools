@@ -48,13 +48,14 @@ class Config:
         self.deployments_per_ns = int(os.getenv('DEPLOYMENTS_PER_NS', '3'))
         self.max_concurrent_operations = int(os.getenv('MAX_CONCURRENT_OPERATIONS', '50'))
         self.namespace_ready_timeout = int(os.getenv('NAMESPACE_READY_TIMEOUT', '60'))
+        self.deployment_ready_timeout = int(os.getenv('DEPLOYMENT_READY_TIMEOUT', '600'))
         self.log_file = os.getenv('LOG_FILE', 'deployment_test.log')
         self.log_level = os.getenv('LOG_LEVEL', 'INFO')
         self.cleanup_on_completion = os.getenv('CLEANUP_ON_COMPLETION', 'false').lower() == 'true'
         self.k8s_verify_ssl: Optional[bool] = self._get_verify_ssl_setting()
         self.kubeconfig_path: Optional[str] = os.getenv('KUBECONFIG')
         self.k8s_ca_cert_path: Optional[str] = None
-        
+
         # NEW: Service creation control
         self.service_enabled = os.getenv('SERVICE_ENABLED', 'false').lower() == 'true'
 
@@ -798,18 +799,18 @@ tail -f /dev/null
                 )
                 
                 # Wait for deployment to be ready
-                is_ready = await self.wait_for_deployment_ready(namespace, name)
-                
+                is_ready = await self.wait_for_deployment_ready(namespace, name, self.config.deployment_ready_timeout)
+
                 # MODIFIED: Create service only if enabled
                 if is_ready and self.config.service_enabled:
                     service_created = await self.create_service(namespace, name)
                     return is_ready and service_created
-                
+
                 return is_ready
-                
+
             except ApiException as e:
                 if e.status == 409:
-                    return await self.wait_for_deployment_ready(namespace, name)
+                    return await self.wait_for_deployment_ready(namespace, name, self.config.deployment_ready_timeout)
                 self.log_warn(f"Failed to create Deployment {name} in {namespace}: {e}", "DEPLOYMENT")
                 return False
                 
@@ -1776,6 +1777,8 @@ Examples:
                        help='Maximum concurrent operations')
     parser.add_argument('--namespace-timeout', type=int,
                        help='Timeout for namespace readiness in seconds')
+    parser.add_argument('--deployment-ready-timeout', type=int,
+                       help='Timeout for deployment readiness in seconds')
     parser.add_argument('--cleanup', action='store_true',
                        help='Enable cleanup after completion')
     parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
@@ -1845,6 +1848,8 @@ async def main():
         config.max_concurrent_operations = args.max_concurrent
     if args.namespace_timeout is not None:
         config.namespace_ready_timeout = args.namespace_timeout
+    if args.deployment_ready_timeout is not None:
+        config.deployment_ready_timeout = args.deployment_ready_timeout
     if args.cleanup:
         config.cleanup_on_completion = True
     if args.log_level is not None:

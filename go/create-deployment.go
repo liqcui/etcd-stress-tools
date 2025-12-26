@@ -46,8 +46,9 @@ type DeploymentConfig struct {
 	NamespaceReadyTimeout time.Duration
 
 	// Deployment settings
-	DeploymentsPerNS int
-	ServiceEnabled   bool
+	DeploymentsPerNS       int
+	ServiceEnabled         bool
+	DeploymentReadyTimeout time.Duration
 
 	// StatefulSet settings (OOM simulation)
 	StatefulSetEnabled  bool
@@ -88,6 +89,7 @@ func NewDeploymentConfig() *DeploymentConfig {
 		NamespaceReadyTimeout:   time.Duration(getEnvInt("NAMESPACE_READY_TIMEOUT", 60)) * time.Second,
 		DeploymentsPerNS:        getEnvInt("DEPLOYMENTS_PER_NS", 3),
 		ServiceEnabled:          getEnvBool("SERVICE_ENABLED", false),
+		DeploymentReadyTimeout:  time.Duration(getEnvInt("DEPLOYMENT_READY_TIMEOUT", 600)) * time.Second,
 		StatefulSetEnabled:      getEnvBool("STATEFULSET_ENABLED", false),
 		StatefulSetReplicas:     getEnvInt("STATEFULSET_REPLICAS", 3),
 		StatefulSetsPerNS:       getEnvInt("STATEFULSETS_PER_NS", 1),
@@ -584,7 +586,7 @@ func (d *DeploymentTool) createDeployment(ctx context.Context, namespace, name s
 	}
 
 	// Wait for deployment to be ready
-	if err := d.waitForDeploymentReady(ctx, namespace, name, 300*time.Second); err != nil {
+	if err := d.waitForDeploymentReady(ctx, namespace, name, d.config.DeploymentReadyTimeout); err != nil {
 		d.logWarn(fmt.Sprintf("Deployment %s pods not ready: %v", name, err), "DEPLOYMENT")
 		// Return error so it gets counted in error statistics
 		return fmt.Errorf("deployment %s pods not ready after timeout: %w", name, err)
@@ -1466,6 +1468,7 @@ func main() {
 		deploymentsPerNS        = flag.Int("deployments-per-ns", 0, "Number of deployments per namespace")
 		maxConcurrentOperations = flag.Int("max-concurrent-operations", 0, "Maximum number of concurrent operations")
 		serviceEnabled          = flag.Bool("service-enabled", false, "Enable service creation")
+		deploymentReadyTimeout  = flag.Int("deployment-ready-timeout", 0, "Deployment ready timeout in seconds")
 		statefulSetEnabled      = flag.Bool("statefulset-enabled", false, "Enable StatefulSet creation")
 		statefulSetReplicas     = flag.Int("statefulset-replicas", 0, "Number of replicas per StatefulSet")
 		statefulSetsPerNS       = flag.Int("statefulsets-per-ns", 0, "Number of StatefulSets per namespace")
@@ -1520,6 +1523,9 @@ Usage:
 	}
 	if *serviceEnabled {
 		config.ServiceEnabled = true
+	}
+	if *deploymentReadyTimeout != 0 {
+		config.DeploymentReadyTimeout = time.Duration(*deploymentReadyTimeout) * time.Second
 	}
 	if *statefulSetEnabled {
 		config.StatefulSetEnabled = true
